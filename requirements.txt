@@ -1,0 +1,8 @@
+requests
+anthropic
+groq
+python-dotenv
+schedule
+fastapi
+uvicorn[standard]
+pyperclip
