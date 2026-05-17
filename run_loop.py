@@ -7,16 +7,40 @@ sys.stdout.reconfigure(encoding="utf-8")
 import random
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import schedule
 
-from src import config
+from src import config, notifier, token_refresher
 from run_once import main as run_pass
 
 
 INTERVAL_MINUTES = 5
 JITTER_MAX_SECONDS = 30
+TOKEN_CHECK_INTERVAL_HOURS = 24
+
+_last_token_check: datetime | None = None
+
+
+def _maybe_refresh_token() -> None:
+    """Idempotent: refreshes Threads token if old enough; safe to call every tick."""
+    global _last_token_check
+    now = datetime.now()
+    if _last_token_check is not None and now - _last_token_check < timedelta(hours=TOKEN_CHECK_INTERVAL_HOURS):
+        return
+    _last_token_check = now
+    ts = now.strftime("%H:%M:%S")
+    try:
+        result = token_refresher.ensure_fresh()
+        status = result["status"]
+        if status == "refreshed":
+            print(f"[{ts}] [token] OK refreshed — new expiry in {result.get('expires_in_days')} days")
+        elif status == "skipped":
+            print(f"[{ts}] [token] -- {result.get('reason')}")
+        else:
+            print(f"[{ts}] [token] !! {result.get('reason')}")
+    except Exception as e:
+        notifier.alert_error("Token refresh tick crashed", f"{type(e).__name__}: {e}")
 
 
 def in_quiet_hours() -> bool:
@@ -29,6 +53,7 @@ def in_quiet_hours() -> bool:
 
 
 def tick():
+    _maybe_refresh_token()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if in_quiet_hours():
         print(f"[{now}] -- quiet hours ({config.QUIET_HOURS_START:02d}:00-{config.QUIET_HOURS_END:02d}:00), skip --\n")
@@ -52,6 +77,7 @@ def main():
     print(f"  DRY_RUN      : {config.DRY_RUN}")
     print(f"  LLM          : {config.LLM_PROVIDER}")
     print(f"  quiet hours  : {config.QUIET_HOURS_START:02d}:00 - {config.QUIET_HOURS_END:02d}:00")
+    print(f"  token check  : on startup + every {TOKEN_CHECK_INTERVAL_HOURS}h (auto refresh if > {config.THREADS_TOKEN_REFRESH_THRESHOLD_DAYS} days old)")
     print("  stop         : Ctrl+C")
     print("=" * 50)
 
