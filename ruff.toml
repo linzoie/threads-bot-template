@@ -1,0 +1,13 @@
+# ruff 設定 — 由 .claude/hooks/after-edit.ps1 自動執行
+# （對改動的 .py 檔跑 ruff check --fix + ruff format）
+line-length = 100
+target-version = "py313"
+
+[lint]
+# 預設規則 + 常用實用規則；刻意保持寬鬆，避免淹沒既有程式碼。
+# E=pycodestyle, F=pyflakes, W=warning, I=isort, UP=pyupgrade, B=bugbear
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]  # 行長交給 formatter 處理
+
+[format]
+quote-style = "double"
