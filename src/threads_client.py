@@ -1,5 +1,6 @@
 """Thin wrapper for the Threads Graph API endpoints we actually use."""
 import requests
+
 from . import config
 
 

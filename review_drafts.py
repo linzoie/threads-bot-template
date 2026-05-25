@@ -4,6 +4,7 @@ Each draft you 'approve' is copied to your clipboard and the original post is
 opened in your browser. You then paste + post by hand. Nothing is sent via API.
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 import webbrowser
@@ -20,11 +21,11 @@ def show(draft: dict, idx: int, total: int) -> None:
     print(f"By       : @{draft.get('post_username','?')}")
     print(f"Posted   : {draft.get('post_timestamp','')[:19]}")
     print(f"Permalink: {draft.get('post_permalink','(none)')}")
-    print(f"\n--- Original post ---")
+    print("\n--- Original post ---")
     print(f"  {draft.get('post_text','').strip()}")
-    print(f"\n--- Claude's reasoning ---")
+    print("\n--- Claude's reasoning ---")
     print(f"  {draft.get('reason','')}")
-    print(f"\n--- Draft reply ---")
+    print("\n--- Draft reply ---")
     print(f"  {draft.get('reply','')}")
     print()
 

@@ -9,7 +9,7 @@ a self-signed cert isn't in any root store. Click Advanced -> Proceed to
 localhost (unsafe) once; the localhost server receives Meta's redirect
 and OAuth finishes normally.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from cryptography import x509
@@ -31,7 +31,7 @@ def ensure_cert(cert_dir: Path, hostname: str = "localhost", days: int = 365) ->
         x509.NameAttribute(NameOID.COMMON_NAME, hostname),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "threads-bot oauth localhost"),
     ])
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)

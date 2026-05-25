@@ -7,10 +7,12 @@ Usage:
     .\.venv\Scripts\python.exe draft_one.py
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
-import pyperclip
 import webbrowser
+
+import pyperclip
 
 from src import drafter
 
@@ -60,7 +62,7 @@ def main():
         print(f"score        : {decision.get('score', 0):.2f}")
         print(f"should_engage: {decision.get('should_engage')}")
         print(f"reason       : {decision.get('reason', '')}")
-        print(f"\nClaude 草稿：")
+        print("\nClaude 草稿：")
         print(f"  {decision.get('reply') or '(略過，不建議留言)'}")
         print("=" * 70)
 

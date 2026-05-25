@@ -2,6 +2,7 @@
 Press Ctrl+C to stop.
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 import random
@@ -11,9 +12,8 @@ from datetime import datetime, timedelta
 
 import schedule
 
-from src import config, notifier, token_refresher
 from run_once import main as run_pass
-
+from src import config, notifier, token_refresher
 
 INTERVAL_MINUTES = 5
 JITTER_MAX_SECONDS = 30

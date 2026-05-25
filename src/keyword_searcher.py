@@ -1,5 +1,6 @@
 """Wrap the Threads keyword_search endpoint."""
 import requests
+
 from . import config
 
 

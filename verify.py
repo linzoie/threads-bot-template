@@ -1,8 +1,10 @@
 """Sanity check: Threads token works AND chosen LLM provider works."""
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 import requests
+
 from src import config
 
 

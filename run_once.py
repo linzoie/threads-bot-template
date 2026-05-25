@@ -5,6 +5,7 @@ Inspect the output to see what *would* be posted, then flip DRY_RUN=false in .en
 when you're confident.
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 from src import config, pipeline, threads_client

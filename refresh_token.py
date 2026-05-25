@@ -11,6 +11,7 @@ is for manual checks, ad-hoc force-refresh, or Task Scheduler if you decide
 to add it later.
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 import argparse
@@ -34,8 +35,8 @@ def main():
     print("  Threads long-lived token — status")
     print("=" * 64)
     if age is None:
-        print(f"  refreshed_at : (unknown — never recorded)")
-        print(f"  age          : unknown — will treat as due on next refresh")
+        print("  refreshed_at : (unknown — never recorded)")
+        print("  age          : unknown — will treat as due on next refresh")
     else:
         days_used = age.days
         hours = age.seconds // 3600
@@ -57,7 +58,7 @@ def main():
         print(f"  reason: {result['reason']}")
     if status == "refreshed":
         print(f"  new token issued — expires in ~{result.get('expires_in_days')} days")
-        print(f"  .env updated (backup at .env.backup)")
+        print("  .env updated (backup at .env.backup)")
 
 
 if __name__ == "__main__":

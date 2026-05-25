@@ -7,7 +7,6 @@ Order matters: first match wins. Edit RULES below to tweak.
 """
 import re
 
-
 # ---------------------------------------------------------------------------
 # Helpers for the emoji / short-praise rule
 # ---------------------------------------------------------------------------

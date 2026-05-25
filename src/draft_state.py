@@ -4,7 +4,7 @@ draft_queue.jsonl     pending drafts awaiting review
 processed_drafts.jsonl drafts you've acted on (approved / edited / skipped / deleted)
 """
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,7 +53,7 @@ def mark_processed(draft: dict, action: str, edited_reply: str | None = None) ->
     entry = {
         **draft,
         "action": action,
-        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "processed_at": datetime.now(UTC).isoformat(),
         "final_reply": edited_reply if edited_reply else draft.get("reply"),
     }
     with PROCESSED.open("a", encoding="utf-8") as f:

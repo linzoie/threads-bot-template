@@ -9,5 +9,19 @@ target-version = "py313"
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]  # 行長交給 formatter 處理
 
+[lint.per-file-ignores]
+# 根目錄腳本通常先做 sys.path.insert / load_dotenv / sys.stdout.reconfigure
+# 才能 import，E402 是設計使然，逐檔豁免（src/ 內維持嚴格）
+"configure.py" = ["E402"]
+"draft_one.py" = ["E402"]
+"find_drafts.py" = ["E402"]
+"oauth_login.py" = ["E402"]
+"oauth_paste.py" = ["E402"]
+"refresh_token.py" = ["E402"]
+"review_drafts.py" = ["E402"]
+"run_loop.py" = ["E402"]
+"run_once.py" = ["E402"]
+"verify.py" = ["E402"]
+
 [format]
 quote-style = "double"

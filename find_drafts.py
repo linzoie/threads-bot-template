@@ -3,11 +3,12 @@
 Run this whenever you want fresh drafts. Then run review_drafts.py to act on them.
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 from datetime import datetime
 
-from src import config, drafter, draft_state, keyword_searcher
+from src import config, draft_state, drafter, keyword_searcher
 
 
 def main():

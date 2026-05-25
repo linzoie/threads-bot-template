@@ -21,6 +21,7 @@ Usage:
     .\.venv\Scripts\python.exe oauth_paste.py --verify
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 import argparse
@@ -58,7 +59,7 @@ def main():
     print("  Threads OAuth — L1 paste-URL flow")
     print("=" * 64)
     print(f"  redirect URI : {args.redirect_uri}")
-    print(f"  (this must be in Meta Dashboard -> Valid OAuth Redirect URIs)")
+    print("  (this must be in Meta Dashboard -> Valid OAuth Redirect URIs)")
     print()
     print("Open this URL, click [Authorize], then paste the redirected URL back here:")
     print()
@@ -100,16 +101,16 @@ def main():
         )
         sys.exit(1)
 
-    print(f"\n[OK] DONE")
+    print("\n[OK] DONE")
     print(f"  user_id          : {result.get('user_id')}")
     print(f"  token issued at  : {result.get('refreshed_at')}")
     print(f"  expires in days  : ~{result.get('expires_in_days')}")
-    print(f"  .env updated     : THREADS_LONG_LIVED_TOKEN + THREADS_TOKEN_REFRESHED_AT (backup at .env.backup)")
+    print("  .env updated     : THREADS_LONG_LIVED_TOKEN + THREADS_TOKEN_REFRESHED_AT (backup at .env.backup)")
 
     if args.verify:
         _run_verify()
     else:
-        print(f"\n下一步：./.venv/Scripts/python.exe verify.py")
+        print("\n下一步：./.venv/Scripts/python.exe verify.py")
 
 
 if __name__ == "__main__":

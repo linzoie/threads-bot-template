@@ -22,6 +22,7 @@ Usage:
     .\.venv\Scripts\python.exe oauth_login.py --verify       # auto-run verify.py after writing token
 """
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 import argparse
@@ -58,7 +59,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "<!doctype html><html><body style='font-family:system-ui;padding:60px;text-align:center'>"
                 "<h1 style='color:#0a7'>OAuth 完成</h1>"
                 "<p>可以關閉這個分頁，回到 terminal 看新 token 寫入結果。</p>"
-                "</body></html>".encode("utf-8")
+                "</body></html>".encode()
             )
         else:
             _Handler.captured_error = self.path
@@ -94,7 +95,7 @@ def main():
     print("  Threads OAuth — L2 localhost HTTPS callback flow")
     print("=" * 64)
     print(f"  redirect URI : {redirect_uri}")
-    print(f"  (this must be in Meta Dashboard -> Valid OAuth Redirect URIs)")
+    print("  (this must be in Meta Dashboard -> Valid OAuth Redirect URIs)")
     print()
 
     cert_path, key_path, cert_mode = cert_manager.ensure_cert(
@@ -172,16 +173,16 @@ def main():
         )
         sys.exit(1)
 
-    print(f"\n[OK] DONE")
+    print("\n[OK] DONE")
     print(f"  user_id          : {result.get('user_id')}")
     print(f"  token issued at  : {result.get('refreshed_at')}")
     print(f"  expires in days  : ~{result.get('expires_in_days')}")
-    print(f"  .env updated     : THREADS_LONG_LIVED_TOKEN + THREADS_TOKEN_REFRESHED_AT (backup at .env.backup)")
+    print("  .env updated     : THREADS_LONG_LIVED_TOKEN + THREADS_TOKEN_REFRESHED_AT (backup at .env.backup)")
 
     if args.verify:
         _run_verify()
     else:
-        print(f"\n下一步：./.venv/Scripts/python.exe verify.py")
+        print("\n下一步：./.venv/Scripts/python.exe verify.py")
 
 
 if __name__ == "__main__":

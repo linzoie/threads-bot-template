@@ -1,9 +1,9 @@
 """互動式 .env 設定精靈。給非工程師朋友雙擊用。"""
 import sys
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"

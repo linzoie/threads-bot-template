@@ -19,8 +19,8 @@ generic、沒有你的個性。
 """
 import json
 import re
-from . import llm
 
+from . import llm
 
 SYSTEM = """你是一個 Threads 創作者的留言助理。
 

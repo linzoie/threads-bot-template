@@ -9,14 +9,12 @@ complete_and_save() bundles steps 2-3 plus the .env write so callers only
 need to feed it a code + the same redirect_uri used in step 1.
 """
 import os
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlencode
 
 import requests
 
 from . import config, token_refresher
-
 
 AUTHORIZE_URL = "https://threads.net/oauth/authorize"
 SHORT_LIVED_TOKEN_URL = "https://graph.threads.net/oauth/access_token"
@@ -32,7 +30,7 @@ DEFAULT_SCOPES = [
 ]
 
 
-def build_authorize_url(redirect_uri: str, scopes: Optional[list] = None, state: str = "threadsbot") -> str:
+def build_authorize_url(redirect_uri: str, scopes: list | None = None, state: str = "threadsbot") -> str:
     params = {
         "client_id": config.THREADS_APP_ID,
         "redirect_uri": redirect_uri,
@@ -43,7 +41,7 @@ def build_authorize_url(redirect_uri: str, scopes: Optional[list] = None, state:
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
 
-def extract_code_from_redirect(url_or_path: str) -> Optional[str]:
+def extract_code_from_redirect(url_or_path: str) -> str | None:
     """Pull 'code' from a full URL or just a path?query string. Strips Meta's #_=_ fragment."""
     if "?" not in url_or_path:
         return None
@@ -100,7 +98,7 @@ def complete_and_save(code: str, redirect_uri: str) -> dict:
     if not ll_token:
         return {"status": "error", "step": "long_lived", "response": ll_resp}
 
-    now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    now_iso = datetime.now(UTC).replace(microsecond=0).isoformat()
     env_path = config.ROOT / ".env"
     token_refresher._update_env(env_path, {
         "THREADS_LONG_LIVED_TOKEN": ll_token,

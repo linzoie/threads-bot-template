@@ -1,6 +1,6 @@
 """Persistent state: which comments we've already replied to, and the human-review queue."""
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +33,7 @@ def mark_replied(comment_id: str) -> None:
 
 def add_to_human_queue(comment: dict, parent_post: dict, reason: str) -> None:
     entry = {
-        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "queued_at": datetime.now(UTC).isoformat(),
         "reason": reason,
         "comment": comment,
         "parent_post": {"id": parent_post.get("id"), "text": parent_post.get("text")},
@@ -44,7 +44,7 @@ def add_to_human_queue(comment: dict, parent_post: dict, reason: str) -> None:
 
 def log_action(comment_id: str, action: str, detail: dict | None = None) -> None:
     entry = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
         "comment_id": comment_id,
         "action": action,
         "detail": detail or {},

@@ -17,20 +17,17 @@ Three modes (CERT_MODE in .env, default mkcert_auto):
                    Browser shows 'not private' warning first time per machine,
                    click Advanced -> Proceed once. Zero external dependencies.
 """
-import ctypes
+
 import hashlib
 import os
 import platform
 import shutil
 import subprocess
-import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 from . import oauth_cert
-
 
 MKCERT_VERSION = "v1.4.4"
 MKCERT_BASE_URL = f"https://github.com/FiloSottile/mkcert/releases/download/{MKCERT_VERSION}"
@@ -40,10 +37,10 @@ MKCERT_BASE_URL = f"https://github.com/FiloSottile/mkcert/releases/download/{MKC
 _BINARIES = {
     ("Windows", "amd64"): f"mkcert-{MKCERT_VERSION}-windows-amd64.exe",
     ("Windows", "arm64"): f"mkcert-{MKCERT_VERSION}-windows-arm64.exe",
-    ("Darwin",  "amd64"): f"mkcert-{MKCERT_VERSION}-darwin-amd64",
-    ("Darwin",  "arm64"): f"mkcert-{MKCERT_VERSION}-darwin-arm64",
-    ("Linux",   "amd64"): f"mkcert-{MKCERT_VERSION}-linux-amd64",
-    ("Linux",   "arm64"): f"mkcert-{MKCERT_VERSION}-linux-arm64",
+    ("Darwin", "amd64"): f"mkcert-{MKCERT_VERSION}-darwin-amd64",
+    ("Darwin", "arm64"): f"mkcert-{MKCERT_VERSION}-darwin-arm64",
+    ("Linux", "amd64"): f"mkcert-{MKCERT_VERSION}-linux-amd64",
+    ("Linux", "arm64"): f"mkcert-{MKCERT_VERSION}-linux-arm64",
 }
 
 VALID_MODES = ("mkcert_auto", "mkcert_manual", "self_signed")
@@ -54,7 +51,9 @@ class _MkcertUnavailable(Exception):
     pass
 
 
-def ensure_cert(cert_dir: Path, mode: Optional[str] = None, hostname: str = "localhost") -> tuple[Path, Path, str]:
+def ensure_cert(
+    cert_dir: Path, mode: str | None = None, hostname: str = "localhost"
+) -> tuple[Path, Path, str]:
     """Return (cert_path, key_path, actual_mode_used)."""
     mode = (mode or os.environ.get("CERT_MODE", DEFAULT_MODE)).strip().lower()
     if mode not in VALID_MODES:
@@ -69,7 +68,7 @@ def ensure_cert(cert_dir: Path, mode: Optional[str] = None, hostname: str = "loc
             return cert, key, "mkcert"
         except _MkcertUnavailable as e:
             print(f"[cert] mkcert path unavailable: {e}")
-            print(f"[cert] falling back to self-signed (browser will warn first time)")
+            print("[cert] falling back to self-signed (browser will warn first time)")
 
     cert, key = oauth_cert.ensure_cert(cert_dir, hostname=hostname)
     return cert, key, "self_signed"
@@ -89,9 +88,19 @@ def _try_mkcert(cert_dir: Path, hostname: str, auto_download: bool) -> tuple[Pat
     key_path = cert_dir / "mkcert_key.pem"
     if not (cert_path.exists() and key_path.exists()):
         r = subprocess.run(
-            [str(mkcert), "-cert-file", str(cert_path), "-key-file", str(key_path),
-             hostname, "127.0.0.1"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            [
+                str(mkcert),
+                "-cert-file",
+                str(cert_path),
+                "-key-file",
+                str(key_path),
+                hostname,
+                "127.0.0.1",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if r.returncode != 0:
             raise _MkcertUnavailable(f"mkcert cert gen failed: {r.stderr.strip()}")
@@ -99,7 +108,7 @@ def _try_mkcert(cert_dir: Path, hostname: str, auto_download: bool) -> tuple[Pat
     return cert_path, key_path
 
 
-def _find_mkcert(cert_dir: Path, auto_download: bool) -> Optional[Path]:
+def _find_mkcert(cert_dir: Path, auto_download: bool) -> Path | None:
     sys_mkcert = shutil.which("mkcert")
     if sys_mkcert:
         return Path(sys_mkcert)
@@ -124,7 +133,14 @@ def _find_mkcert(cert_dir: Path, auto_download: bool) -> Optional[Path]:
 
 def _verify_mkcert_works(mkcert: Path) -> bool:
     try:
-        r = subprocess.run([str(mkcert), "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+        r = subprocess.run(
+            [str(mkcert), "-version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
         return r.returncode == 0
     except Exception:
         return False
@@ -153,18 +169,31 @@ def _ensure_mkcert_ca(mkcert: Path) -> None:
         try:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
             )
             if r.returncode != 0:
                 raise _MkcertUnavailable(
                     f"elevated mkcert -install failed (user denied UAC?): {r.stderr.strip() or 'no stderr'}"
                 )
         except subprocess.TimeoutExpired:
-            raise _MkcertUnavailable("mkcert -install timed out (no UAC response within 2 min)")
+            raise _MkcertUnavailable(
+                "mkcert -install timed out (no UAC response within 2 min)"
+            ) from None
     else:
         print("  系統可能要求 sudo 密碼")
         print("=" * 64)
-        r = subprocess.run([str(mkcert), "-install"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+        r = subprocess.run(
+            [str(mkcert), "-install"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
         if r.returncode != 0:
             raise _MkcertUnavailable(f"mkcert -install failed: {r.stderr.strip()}")
 
@@ -175,9 +204,16 @@ def _ensure_mkcert_ca(mkcert: Path) -> None:
     print(f"  [OK] CA installed at {caroot}")
 
 
-def _get_caroot(mkcert: Path) -> Optional[Path]:
+def _get_caroot(mkcert: Path) -> Path | None:
     try:
-        r = subprocess.run([str(mkcert), "-CAROOT"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+        r = subprocess.run(
+            [str(mkcert), "-CAROOT"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
         if r.returncode == 0 and r.stdout.strip():
             return Path(r.stdout.strip())
     except Exception:
@@ -191,13 +227,14 @@ def _ask_consent_for_download() -> bool:
     print("  CERT_MODE=mkcert_auto -> 需要下載 mkcert 啟用零警告模式")
     print("=" * 64)
     print(f"  來源    : GitHub releases (FiloSottile/mkcert {MKCERT_VERSION})")
-    print(f"  大小    : 約 5 MB")
-    print(f"  傳輸    : HTTPS to github.com (TLS verified)")
+    print("  大小    : 約 5 MB")
+    print("  傳輸    : HTTPS to github.com (TLS verified)")
     print(f"  存放    : data/mkcert{'.exe' if platform.system() == 'Windows' else ''} (gitignored)")
-    print(f"  接著    : 會跑 mkcert -install (Windows 跳 UAC 一次)")
+    print("  接著    : 會跑 mkcert -install (Windows 跳 UAC 一次)")
     print()
-    print("  下載？[Y/n] 按 n 會 fallback 到自簽 cert (功能不變，瀏覽器會警告) ",
-          end="", flush=True)
+    print(
+        "  下載？[Y/n] 按 n 會 fallback 到自簽 cert (功能不變，瀏覽器會警告) ", end="", flush=True
+    )
     try:
         ans = input().strip().lower()
     except (EOFError, KeyboardInterrupt):

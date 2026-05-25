@@ -10,14 +10,12 @@ run_loop.py on every tick — it gates internally on token age.
 """
 import os
 import shutil
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 import requests
 
 from . import config, notifier
-
 
 REFRESH_ENDPOINT = "https://graph.threads.net/refresh_access_token"
 DEFAULT_THRESHOLD_DAYS = 30
@@ -26,24 +24,24 @@ TOKEN_LIFETIME_DAYS = 60
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
-def _parse_iso(s: str) -> Optional[datetime]:
+def _parse_iso(s: str) -> datetime | None:
     try:
         dt = datetime.fromisoformat(s)
     except (ValueError, TypeError):
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
-def token_age(refreshed_at: str) -> Optional[timedelta]:
+def token_age(refreshed_at: str) -> timedelta | None:
     dt = _parse_iso(refreshed_at)
     if dt is None:
         return None
-    return datetime.now(timezone.utc) - dt
+    return datetime.now(UTC) - dt
 
 
 def _update_env(path: Path, updates: dict) -> None:
@@ -80,7 +78,7 @@ def call_refresh(token: str) -> dict:
     return r.json()
 
 
-def ensure_fresh(threshold_days: Optional[int] = None, *, force: bool = False) -> dict:
+def ensure_fresh(threshold_days: int | None = None, *, force: bool = False) -> dict:
     """Refresh token if older than threshold_days.
 
     Returns one of:
