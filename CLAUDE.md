@@ -88,3 +88,36 @@ Threads 自動回覆 / 草擬 bot 的**公開、無品牌、可 fork** 的教學
 - **絕不** 把客製化後的品牌 prompt（含商業機密、人設細節）誤推到這個公開範本 repo —— 那是 fork 後該推到自己 repo 的東西。
 - Fork 並客製化前讀 `.claude/skills/customization-guide`。
 - 改 Layer 1（安全）後**建議** 自己補測試（可參考 threads-bot 的 `test_pipeline_mock.py` 13 個 mock case）。
+
+## 開發流程
+
+預設走 Superpowers 5.1.0 workflow（詳見工作區 `code/CLAUDE.md` 的「開發流程」段，靠 `@../CLAUDE.md` import 已自動拉入）：
+
+1. `/superpowers:brainstorming` — 收斂模糊需求
+2. `/superpowers:writing-plans` — 產規格＋逐步計畫，寫進 `specs/`
+3. `/superpowers:test-driven-development` — 先寫失敗測試，再實作
+4. `/superpowers:verification-before-completion` — 宣稱完成前跑驗證
+5. `/superpowers:requesting-code-review` — 完成／合併前審查
+
+遇 bug 用 `/superpowers:systematic-debugging`。動到品牌三件套
+（`drafter.py` SYSTEM / `rules.py` RULES / `keywords.txt`）時 `customization-guide`
+skill 會自動載入並提醒填空指引與紅線。
+
+## 完成的定義（Definition of Done）
+
+threads-bot-template 任務完成的具體門檻：
+
+- `.venv\Scripts\ruff.exe check .` **0 errors**
+  （2026-05-25 已清乾淨；34 個 E402 是根目錄腳本的設計 pattern，已在 `ruff.toml` 加 per-file-ignores）
+- 動到品牌三件套（`src/drafter.py` SYSTEM / `src/rules.py` RULES / `keywords.txt`）
+  → 必須對齊 `.claude/skills/customization-guide` 的填空指引、不留半套
+- 動到 4 層管線（`src/pipeline.py` / `safety.py` / `rules.py` / `drafter.py`）
+  → 必須對齊 `.claude/skills/pipeline-layers` 的契約
+- **強烈建議**：本範本沒原生測試，若你 fork 後做出較大功能修改，請從
+  `code/threads-bot/test_pipeline_mock.py` 抓 13 個 mock case 的設計移植過來
+- 跑得起來的功能（`python verify.py`、`python run_once.py` DRY_RUN）已用實際 dry-run 確認
+
+必須做實際執行驗證、看到結果，才能回報完成；**禁止**在未跑驗證時宣稱「應該沒問題 / 應該已修好」。
+
+> Stop hook `.claude/hooks/verify-before-done.ps1` 自動把關 ruff（pytest 分支因本範本沒裝 pytest 會略過）；
+> ruff 失敗會強迫 Claude 繼續修，不能宣告完成。
