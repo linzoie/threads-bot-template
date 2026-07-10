@@ -37,7 +37,7 @@ Bot 每 5 分鐘檢查你 Threads 自己的最新 8 則貼文，**有新留言�
 |---|---|
 | 「請問可以諮詢嗎？」（商業關鍵字） | 用固定模板回覆，引導私訊 |
 | 「🔥🔥🔥」「推」「+1」 | 回一個對應 emoji（🔥 / 🙏） |
-| 「ETF 跟基金差在哪？」（一般提問） | Claude AI 根據你的品牌語氣寫回覆 |
+| 「深蹲跟硬舉先練哪個？」（一般提問） | Claude AI 根據你的品牌語氣寫回覆 |
 | 「是不是詐騙？」（敏感字） | 不自動回，標記給你親自處理 |
 | 「你寫的根本沒用」（負評） | Claude 判斷後標記給你親自處理 |
 
@@ -1334,7 +1334,7 @@ RULES = [
 2. `pip install groq` 在 venv 裡
 3. .env 加 `GROQ_API_KEY=gsk_...` 跟 `GROQ_MODEL=llama-3.3-70b-versatile`
 4. .env 改 `LLM_PROVIDER=groq`
-5. `src/llm.py` 加 Groq 分支（細節看作者原專案）
+5. `src/llm.py` 已內建 Groq 支援（.env 設 `LLM_PROVIDER=groq` 即可切換）
 
 > 💡 Claude Sonnet 寫繁中社群文案品質**明顯較好**。Groq 適合純省錢、可接受品質下降。
 

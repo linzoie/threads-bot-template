@@ -46,7 +46,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob
 
 ## 測試守則（範本目前無測試 —— 建議自己補）
 
-範本不含 `test_pipeline_mock.py`，但 `code/threads-bot/test_pipeline_mock.py` 有 13 個成熟的 mock case 可參考。建議你 fork 後：
+範本不附測試，建議你 fork 後自行建立（以下為各層測試守則）：
 
 - 改 **Layer 0 / 1** → 寫 mock 留言斷言「該被 skip 的有 skip、該進人工佇列的有進」。
 - 改 **Layer 2** → 對每個 RULE 寫一個 mock case（命中該規則、模板輸出符合預期）。

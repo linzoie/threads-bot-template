@@ -47,7 +47,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob
 
 ### Step 3：客製 `RULES`（視業務需要）
 
-範本繼承 threads-bot 的 4 條規則（consultation / collab_or_sponsor / pricing / emoji_or_praise），都是通用商業詢問。多數人 fork 後要做的：
+範本內建 4 條通用規則（consultation / collab_or_sponsor / pricing / emoji_or_praise），都是通用商業詢問。多數人 fork 後要做的：
 
 - 保留 `emoji_or_praise`（純表情／單字回覆 → 用 emoji 回的邏輯通用）
 - 改寫 consultation / collab / pricing 的觸發詞與回覆模板成你業務用語
@@ -57,7 +57,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob
 
 ### Step 4：客製 `keywords.txt`（要用 Feature #2 才需要）
 
-`keywords.txt` 預設整份註解 + 兩個品牌範例（財務／健身）。寫你的關鍵字前先想：
+`keywords.txt` 預設整份註解 + 兩組虛構範例（健身／料理）。寫你的關鍵字前先想：
 
 - **避開會被 MLM／詐騙留言淹沒的詞**（例：投資、賺錢、副業、被動收入、加密貨幣）
 - 避開違反你「絕對禁止」會招麻煩的詞
@@ -69,7 +69,7 @@ allowed-tools: Read, Write, Edit, Grep, Glob
 
 ### Step 6：自己補測試（強烈建議）
 
-範本沒測試。Fork 後請參考 `code/threads-bot/test_pipeline_mock.py` 的 13 個 mock case 自己寫一份。針對你新加的 RULE、客製過的 SYSTEM 各補幾個 case。
+範本不附測試。Fork 後請自己寫一份 mock case 測試：針對你新加的 RULE、客製過的 SYSTEM 各補幾個 case。
 
 ## 客製化前的安全檢查清單
 
