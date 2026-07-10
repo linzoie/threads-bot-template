@@ -122,7 +122,10 @@ $denyPatterns = @(
     @{ rx = '\bmkfs(\.|\s)';                    why = '格式化檔案系統' },
     @{ rx = '\bdd\s+[^;&|]*of=/dev/';           why = 'dd 直接寫入磁碟裝置' },
     @{ rx = 'format-volume|clear-disk|initialize-disk'; why = 'PowerShell 磁碟格式化／清除' },
-    @{ rx = ':\(\)\s*\{\s*:\s*\|\s*:';          why = 'fork bomb' }
+    @{ rx = ':\(\)\s*\{\s*:\s*\|\s*:';          why = 'fork bomb' },
+    # 機密外洩（2026-07-11 依社群研究補；deny 級連 --dangerously-skip-permissions 都擋得住）：
+    # 把機密檔上傳到網路——幾乎無正當日常用途
+    @{ rx = '(curl|wget|iwr|invoke-webrequest)\b[^;&|]*(-T\s|--upload-file|-d\s*@|--data(-binary|-raw|-urlencode)?[= ]@|-F\s+[^;&|]*@)[^;&|]*(\.env|\.pem|\.key|id_rsa|id_ed25519|credentials|\.pfx|secrets?\.(json|ya?ml))'; why = '把機密檔（.env/私鑰/憑證）上傳到網路' }
 )
 foreach ($p in $denyPatterns) {
     if ($cmd -imatch $p.rx) { Deny $p.why }
@@ -135,6 +138,24 @@ foreach ($p in $denyPatterns) {
 # SQL 整表刪除：DELETE FROM 無 WHERE（2026-07-11 紅隊實測穿透後補）
 if ($cmd -imatch '\bDELETE\s+FROM\b' -and $cmd -inotmatch '\bWHERE\b') {
     Ask 'DELETE FROM 無 WHERE 條件（整表刪除）'
+}
+
+# 機密讀取/傾印（2026-07-11 依社群研究補）：讀機密檔或傾印含 token 的環境變數。
+# 這些有正當除錯用途（故用 ask 不用 deny），但輸出可能進 log/被截圖外流，先問。
+# .env.example / .sample / .template / .pub 是公開範本，豁免。
+if ($cmd -imatch '(^|[\s;&|])(cat|type|bat|less|more|head|tail|get-content|gc)\b[^;&|]*\.env\b' `
+        -and $cmd -inotmatch '\.env\.(example|sample|template)\b') {
+    Ask '讀取 .env（可能含 token／金鑰，輸出恐外流）'
+}
+if ($cmd -imatch '(^|[\s;&|])(cat|type|bat|get-content|gc)\b[^;&|]*(id_rsa|id_ed25519|id_ecdsa|\.pem\b|\.pfx\b|\.p12\b|(?<!\.pub)\.key\b|credentials[^;&|]*\.json|secrets?\.(json|ya?ml|toml))' `
+        -and $cmd -inotmatch '\.(pub|example|sample|template)\b') {
+    Ask '讀取私鑰／憑證／機密檔（輸出恐外流）'
+}
+if ($cmd -imatch '\bprintenv\b' -or $cmd -imatch '(get-childitem|gci|ls|dir)\s+env:' -or $cmd -imatch '\benv\s*$') {
+    Ask '傾印全部環境變數（可能含 token／金鑰）'
+}
+if ($cmd -imatch '(echo|write-output|write-host)\s+["'']?\$(\{)?(env:)?\w*(TOKEN|SECRET|KEY|PASSWORD|PASSWD|APIKEY|API_KEY|CREDENTIAL)') {
+    Ask 'echo 含機密的環境變數（輸出恐外流）'
 }
 
 # git restore：只有「純 --staged（不含 --worktree）」是安全的取消暫存
