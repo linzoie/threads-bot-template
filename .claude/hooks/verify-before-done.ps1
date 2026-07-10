@@ -157,6 +157,9 @@ if (Test-Path -LiteralPath $pkgJson) {
             } else {
                 Write-Host 'verify: 無 npm scripts、也無 prettier，無實質驗證可跑（exit 0）'
             }
+            # 誠實揭露：本專案無測試 script，「綠燈」只代表格式對、不代表行為對。
+            # 對抗 DoD 語義稀釋（紅隊弱點 E）——弱模型別把此放行當「測試全綠」。
+            [Console]::Error.WriteLine('[verify] 注意：本 Node 專案無 test/lint/typecheck script，Stop hook 只驗了格式（prettier），未驗行為。若本次改動涉及邏輯，DoD 的「測試全綠」尚未達成——請補測試或手動實跑確認，勿僅憑此放行宣稱完成。')
         }
     } finally {
         Pop-Location

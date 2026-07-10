@@ -57,8 +57,11 @@ function Ask([string]$why) {
 #    回傳 'deny' / 'ask' / 'allow' / $null（此段落非刪除指令或非遞迴）
 # ──────────────────────────────────────────────────────────────
 function Get-DeleteClassification([string]$segment) {
-    $t = $segment.Trim()
-    $isPosixRm = $t -imatch '^(sudo\s+)?rm(\.exe)?\s'
+    $t = $segment.Trim().Trim('(', ')').Trim()
+    # 剝除逃逸前綴（2026-07-11 紅隊實測穿透後補）：環境變數賦值、wrapper 指令
+    while ($t -imatch '^\w+=("[^"]*"|''[^'']*''|\S*)\s+') { $t = $t -replace '^\w+=("[^"]*"|''[^'']*''|\S*)\s+', '' }
+    $t = $t -replace '^(sudo|nohup|time|command|exec)\s+', ''
+    $isPosixRm = $t -imatch '^rm(\.exe)?\s'
     $isPsRm    = $t -imatch '^(remove-item|ri|rd|rmdir|del|erase)\s'
     if (-not ($isPosixRm -or $isPsRm)) { return $null }
 
@@ -129,6 +132,11 @@ foreach ($p in $denyPatterns) {
 # 4) ASK 樣式：使用者「先問」清單 → 強制確認框
 # ──────────────────────────────────────────────────────────────
 
+# SQL 整表刪除：DELETE FROM 無 WHERE（2026-07-11 紅隊實測穿透後補）
+if ($cmd -imatch '\bDELETE\s+FROM\b' -and $cmd -inotmatch '\bWHERE\b') {
+    Ask 'DELETE FROM 無 WHERE 條件（整表刪除）'
+}
+
 # git restore：只有「純 --staged（不含 --worktree）」是安全的取消暫存
 if ($cmd -imatch 'git\s+restore\b') {
     $isStagedOnly = ($cmd -imatch '--staged') -and ($cmd -inotmatch '--worktree')
@@ -146,6 +154,10 @@ $askPatterns = @(
     @{ rx = 'git\s+stash\s+(drop|clear)\b';       why = 'git stash drop/clear（丟棄暫存的修改）' },
     @{ rx = 'git\s+update-ref\s+-d|git\s+reflog\s+expire'; why = '刪除 git 參照／reflog（斷後路）' },
     @{ rx = '\bfind\b[^;&|]*\s-delete\b';         why = 'find -delete（批次刪除檔案）' },
+    @{ rx = '\bxargs\b[^;&|]*\brm\b';             why = 'xargs rm（刪除目標來自管線，靜態不可見）' },
+    @{ rx = '\bchmod\b[^;&|]*\s0?000\b';          why = 'chmod 000（移除所有權限，等同鎖死）' },
+    @{ rx = '\b(mv|cp)\s+[^;&|>]*\s/dev/null\b';  why = '搬移/覆蓋經 /dev/null（毀檔）' },
+    @{ rx = '\btruncate\b[^;&|]*-s\s*0\b';        why = 'truncate -s 0（清空檔案內容）' },
     @{ rx = '(curl|wget|iwr|invoke-webrequest)\b[^;&|]*\|\s*(ba|z|da)?sh\b'; why = '下載內容直接餵給 shell 執行（供應鏈風險）' },
     @{ rx = '(iwr|invoke-webrequest|downloadstring)[^;&|]*\|\s*iex\b';       why = '下載內容直接 Invoke-Expression（供應鏈風險）' }
 )
