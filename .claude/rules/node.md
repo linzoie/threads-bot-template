@@ -25,4 +25,7 @@ paths:
 ## 慣例
 
 - 不確定外部函式庫 API → 查最新官方文件，不憑記憶編造。
+- **改既有 code 先用 Grep 結構檢索**（符號、精確 pattern）定位真實定義再動手，勝過憑語意/
+  記憶猜測——結構檢索 precision 遠高，避免改到過期或想像的位置（grounding 機械化 2026-07-11）。
+- 平台/工具特定行為（wrangler/Cloudflare/Netlify/建置設定）→ 查官方文件確認版本行為，不憑記憶。
 - 模組化與命名見專案自身 CLAUDE.md 的 module conventions。
