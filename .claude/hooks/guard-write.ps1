@@ -27,7 +27,19 @@ if (-not $fp) { exit 0 }
 # 反斜線與正斜線都要涵蓋（Windows 上 file_path 為反斜線——這是 S4a 的關鍵）
 $protectRx = '[\\/]\.claude[\\/](hooks|agents)[\\/]|[\\/]settings\.json$|[\\/]\.governance[\\/](project-template|bin|tests)[\\/]'
 
+# outcome 觀測（2026-07-11）：記 ask 到 governance-logs。fail-open。
+function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
+    try {
+        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
+        $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress
+        Add-Content -Path $f -Value $line -Encoding utf8
+    } catch { }
+}
+
 if ($fp -imatch $protectRx) {
+    Write-GovLog 'guard-write' 'ask' '寫入受保護治理檔'
     $reason = "使用者硬規則「保護治理層自身」：正在寫入治理檔（hook/settings/agent/governance）" +
               "——這會改動安全防線本身，請確認不是被誘導的自我繳械後再放行。檔案：$fp"
     $out = @{

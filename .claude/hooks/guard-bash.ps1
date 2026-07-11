@@ -37,7 +37,22 @@ if (-not $cmd) { exit 0 }
 # 危險指令「文字」會被誤判 DENY（低頻可接受，非 bug）。
 $cmd = $cmd -replace '[\r\n]+', ' ; '
 
+# outcome 觀測（2026-07-11）：把每次 deny/ask 記一行到 ~/.claude/governance-logs（月檔）。
+# 記 decision + why 分類（why 可能含少量指令片段如 rm 目標，但不含完整指令；且為本機私有
+# log、信任層級同 debug-logs）。全程 fail-open——記 log 失敗絕不影響決策。
+# 用來回答「牆有沒有被撞、ask 是否被 rubber-stamp」，是 outcome 觀測不是安全邊界。
+function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
+    try {
+        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
+        $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress
+        Add-Content -Path $f -Value $line -Encoding utf8
+    } catch { }
+}
+
 function Deny([string]$why) {
+    Write-GovLog 'guard-bash' 'deny' $why
     [Console]::Error.WriteLine("[BLOCKED] guard 攔截危險指令：$why")
     [Console]::Error.WriteLine("  指令內容：$cmd")
     [Console]::Error.WriteLine("  此類指令一律由使用者本人於終端機手動執行，不由 Claude 代行。")
@@ -79,6 +94,7 @@ function Get-AskFloodPrefix {
 }
 
 function Ask([string]$why) {
+    Write-GovLog 'guard-bash' 'ask' $why
     $reason = (Get-AskFloodPrefix) + "使用者硬規則「破壞性／難復原動作一律先問」：$why。請確認後再放行。"
     $out = @{
         hookSpecificOutput = @{

@@ -23,7 +23,19 @@ try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
 $tool = $data.tool_name
 if (-not $tool) { exit 0 }
 
+# outcome 觀測（2026-07-11）：記 ask 到 governance-logs（記 tool_name，屬非機密）。fail-open。
+function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
+    try {
+        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
+        $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress
+        Add-Content -Path $f -Value $line -Encoding utf8
+    } catch { }
+}
+
 function AskMcp([string]$why) {
+    Write-GovLog 'guard-mcp' 'ask' $why
     $out = @{
         hookSpecificOutput = @{
             hookEventName            = 'PreToolUse'

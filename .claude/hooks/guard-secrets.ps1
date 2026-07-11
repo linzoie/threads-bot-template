@@ -29,7 +29,19 @@ if (-not $cmd) { exit 0 }
 # 快篩：不含 git add / git commit 就直接放行
 if ($cmd -inotmatch 'git\b[^;&|]*\b(add|commit)\b') { exit 0 }
 
+# outcome 觀測（2026-07-11）：記 deny 到 governance-logs（不記檔名/內容，避免洩密）。fail-open。
+function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
+    try {
+        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
+        $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress
+        Add-Content -Path $f -Value $line -Encoding utf8
+    } catch { }
+}
+
 function DenySecrets([string]$why, [string[]]$hits) {
+    Write-GovLog 'guard-secrets' 'deny' $why
     [Console]::Error.WriteLine("[BLOCKED] guard-secrets 機密防線：$why")
     foreach ($h in $hits) { [Console]::Error.WriteLine("  - $h") }
     [Console]::Error.WriteLine("  處置：確認這些檔案／內容不是機密；若是機密請加入 .gitignore 並移出暫存區，")
