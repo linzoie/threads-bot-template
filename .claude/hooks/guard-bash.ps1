@@ -32,6 +32,11 @@ try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
 $cmd = $data.tool_input.command
 if (-not $cmd) { exit 0 }
 
+# A1（2026-07-11）：換行/CR 正規化成分隔符——防「echo hi<換行>rm -rf /」這類換行切段繞過
+# （categorical fix：讓換行後的段落照常被逐段錨定檢查）。已知取捨：heredoc/字串字面內的
+# 危險指令「文字」會被誤判 DENY（低頻可接受，非 bug）。
+$cmd = $cmd -replace '[\r\n]+', ' ; '
+
 function Deny([string]$why) {
     [Console]::Error.WriteLine("[BLOCKED] guard 攔截危險指令：$why")
     [Console]::Error.WriteLine("  指令內容：$cmd")
@@ -92,9 +97,23 @@ function Ask([string]$why) {
 # ──────────────────────────────────────────────────────────────
 function Get-DeleteClassification([string]$segment) {
     $t = $segment.Trim().Trim('(', ')').Trim()
-    # 剝除逃逸前綴（2026-07-11 紅隊實測穿透後補）：環境變數賦值、wrapper 指令
-    while ($t -imatch '^\w+=("[^"]*"|''[^'']*''|\S*)\s+') { $t = $t -replace '^\w+=("[^"]*"|''[^'']*''|\S*)\s+', '' }
-    $t = $t -replace '^(sudo|nohup|time|command|exec)\s+', ''
+    # 剝除逃逸前綴到真正動詞（2026-07-11 紅隊實測穿透後擴充 A2a）：迴圈到穩定，讓
+    # `env rm`/`timeout 5 rm`/`\rm`/`eval "rm …"`/`FOO=bar rm` 都露出 rm。
+    # 殘留（已知漏、待 AST 層）：base64 解碼後執行、變數間接 `r=rm;$r`、printf|sh。
+    $prev = $null
+    while ($t -ne $prev) {
+        $prev = $t
+        $t = $t.Trim().Trim('(', ')').Trim()
+        $t = $t -replace '^\w+=("[^"]*"|''[^'']*''|\S*)\s+', ''                                  # FOO=bar
+        $t = $t -replace '^(sudo|nohup|time|command|exec|env|stdbuf\s+\S+|nice(\s+-n\s+-?\d+)?)\s+', ''  # 裸 wrapper
+        $t = $t -replace '^timeout(\s+(-{1,2}\S+|\d+[smhd]?))*\s+', ''                            # timeout [flags/時長…] cmd
+        $t = $t -replace '^\\(?=\w)', ''                                                          # \rm -> rm
+        if ($t -imatch '^eval\s+') {                                                              # eval "rm …" -> rm …
+            $t = ($t -replace '^eval\s+', '').Trim()
+            if ($t -match '^"(.*)"$') { $t = $Matches[1] }
+            elseif ($t -match "^'(.*)'$") { $t = $Matches[1] }
+        }
+    }
     $isPosixRm = $t -imatch '^rm(\.exe)?\s'
     $isPsRm    = $t -imatch '^(remove-item|ri|rd|rmdir|del|erase)\s'
     if (-not ($isPosixRm -or $isPsRm)) { return $null }
@@ -192,6 +211,23 @@ if ($cmd -imatch '(echo|write-output|write-host)\s+["'']?\$(\{)?(env:)?\w*(TOKEN
     Ask 'echo 含機密的環境變數（輸出恐外流）'
 }
 
+# A2b（2026-07-11）：bash -c / sh -c 包裹破壞性指令 → ASK（保守：不遞迴解析內層引號，
+# 僅偵測「殼包裹旗標」與破壞性動詞共現。巢狀/base64/變數間接為已知殘留，見 guard-cases）。
+if ($cmd -imatch '\b(ba|z|da)?sh\s+-[a-z]*c\b' `
+        -and $cmd -imatch '\brm\s+-[a-zA-Z]*[rf]|\bmkfs(\.|\s)|\bdd\s+[^;&|]*of=/dev/|\bDROP\s+(TABLE|DATABASE|SCHEMA)\b|:\(\)\s*\{\s*:') {
+    Ask 'bash -c/sh -c 包裹疑似破壞性指令（保守攔截，請確認內層安全）'
+}
+
+# A3（2026-07-11）：讀機密 × 送網路 組合 → ASK（精確 curl 上傳已在 DENY 段；此處補
+# scp/rsync/python/node/--post-file/http.server 等非 curl 管道。排除 curl/wget 下載目標
+# `-o/-O/--output/>` 免誤殺「下載存成 .pem/.key」）。heuristic 故用 ASK 不用 DENY。
+$a3secret   = '\.env\b|\.pem\b|(?<!\.pub)\.key\b|id_rsa|id_ed25519|credentials|\.pfx\b|secrets?\.(json|ya?ml)'
+$a3send     = '\b(scp|rsync|nc|ncat|telnet)\b|--post-file|\bhttp\.server\b|-m\s+http\.server|\b(python[0-9.]*|node|php|ruby)\b[^;&|]*(requests|urllib|urlopen|http\b|fetch|socket|net/http)'
+$a3download = '\b(curl|wget)\b[^;&|]*(-o\b|-O\b|--output\b|>)'
+if ($cmd -imatch $a3secret -and $cmd -imatch $a3send -and $cmd -inotmatch $a3download) {
+    Ask '疑似把機密檔（.env/私鑰/憑證）送出網路（scp/rsync/python/wget --post-file 等）'
+}
+
 # git restore：只有「純 --staged（不含 --worktree）」是安全的取消暫存
 if ($cmd -imatch 'git\s+restore\b') {
     $isStagedOnly = ($cmd -imatch '--staged') -and ($cmd -inotmatch '--worktree')
@@ -213,8 +249,17 @@ $askPatterns = @(
     @{ rx = '\bchmod\b[^;&|]*\s0?000\b';          why = 'chmod 000（移除所有權限，等同鎖死）' },
     @{ rx = '\b(mv|cp)\s+[^;&|>]*\s/dev/null\b';  why = '搬移/覆蓋經 /dev/null（毀檔）' },
     @{ rx = '\btruncate\b[^;&|]*-s\s*0\b';        why = 'truncate -s 0（清空檔案內容）' },
+    # A4（2026-07-11）：保守毀檔式（語義明確就是清空，日常幾乎不用；不碰一般 > 免誤殺重導）
+    @{ rx = '\bcp\s+/dev/null\s+\S';              why = 'cp /dev/null 覆蓋檔案（清空內容）' },
+    @{ rx = '(^|[\s;&|]):\s*>\s*[^\s>]';          why = ':> 清空檔案內容' },
+    # A5（2026-07-11）：供應鏈——執行遠端來源
+    @{ rx = '\bnpx\s+[^;&|]*(https?://|github:)'; why = 'npx 執行遠端套件（供應鏈風險）' },
+    @{ rx = '\bpip[0-9.]*\s+install\s+[^;&|]*(git\+|https?://)'; why = 'pip 從 URL/git 安裝（供應鏈風險）' },
+    @{ rx = 'core\.hookspath';                    why = '設定 git core.hooksPath（可能劫持 git hooks）' },
     @{ rx = '(curl|wget|iwr|invoke-webrequest)\b[^;&|]*\|\s*(ba|z|da)?sh\b'; why = '下載內容直接餵給 shell 執行（供應鏈風險）' },
-    @{ rx = '(iwr|invoke-webrequest|downloadstring)[^;&|]*\|\s*iex\b';       why = '下載內容直接 Invoke-Expression（供應鏈風險）' }
+    @{ rx = '(iwr|invoke-webrequest|downloadstring)[^;&|]*\|\s*iex\b';       why = '下載內容直接 Invoke-Expression（供應鏈風險）' },
+    # A2b 延伸（2026-07-11）：解碼器/產生器管道餵 shell（混淆執行）→ ASK
+    @{ rx = '(base64\s+-d|base64\s+--decode|xxd\s+-r|printf\b)[^;&|]*\|\s*(ba|z|da)?sh\b'; why = 'base64/printf 等解碼產生後直接餵 shell 執行（混淆式供應鏈風險）' }
 )
 foreach ($p in $askPatterns) {
     if ($cmd -imatch $p.rx) { Ask $p.why }

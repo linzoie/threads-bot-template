@@ -38,7 +38,9 @@ function DenySecrets([string]$why, [string[]]$hits) {
 }
 
 # 敏感「檔名」樣式（對路徑的任一層生效）；.example/.sample/.template 豁免
-$sensitiveNameRx = '(^|[\\/])(\.env(\.[^\\/]+)?|id_rsa|id_ed25519|id_ecdsa|[^\\/]*\.(pem|key|pfx|p12)|credentials[^\\/]*\.json|tokens?[^\\/]*\.json|secrets?\.(json|ya?ml|toml))$'
+# A6（2026-07-11）：.env 家族放寬——涵蓋 prod.env / my.env / config.env.local / .envrc
+#   （`[^\\/]*\.env` 需字面 .env，故 environment.ts / .eslintrc 不誤中）。
+$sensitiveNameRx = '(^|[\\/])([^\\/]*\.env(rc)?(\.[^\\/]+)?|id_rsa|id_ed25519|id_ecdsa|[^\\/]*\.(pem|key|pfx|p12)|credentials[^\\/]*\.json|tokens?[^\\/]*\.json|secrets?\.(json|ya?ml|toml))$'
 $exemptNameRx    = '\.(example|sample|template)$|\.pub$'
 
 function Test-SensitiveName([string]$path) {
@@ -59,8 +61,10 @@ $tokenPatterns = @(
 )
 
 # 決定 git 工作目錄：優先 `git -C <path>`，其次段落前的 `cd <path>`，最後 hook cwd
+# A7（2026-07-11）：`-C` 用 -cmatch 大小寫敏感——`git -c config`（小寫）不再被誤當
+#   gitDir 而 fail-open 放行機密；且假路徑不 exit，改 fallback 到 cwd（fail-closed）。
 $gitDir = $null
-if ($cmd -imatch 'git\s+-C\s+("([^"]+)"|''([^'']+)''|(\S+))') {
+if ($cmd -cmatch 'git\s+-C\s+("([^"]+)"|''([^'']+)''|(\S+))') {
     $gitDir = @($Matches[2], $Matches[3], $Matches[4]) | Where-Object { $_ } | Select-Object -First 1
 }
 if (-not $gitDir -and $cmd -imatch '(^|[;&|]\s*)cd\s+("([^"]+)"|''([^'']+)''|(\S+))\s*(&&|;)') {
@@ -68,7 +72,8 @@ if (-not $gitDir -and $cmd -imatch '(^|[;&|]\s*)cd\s+("([^"]+)"|''([^'']+)''|(\S
 }
 if (-not $gitDir) { $gitDir = $data.cwd }
 if (-not $gitDir) { $gitDir = (Get-Location).Path }
-if (-not (Test-Path -LiteralPath $gitDir)) { exit 0 }
+# 假路徑不 fail-open（放過機密）——退回 cwd 照常掃描
+if (-not (Test-Path -LiteralPath $gitDir)) { $gitDir = (Get-Location).Path }
 
 # ──────────────────────────────────────────────────────────────
 # 檢查 1：git add
