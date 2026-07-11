@@ -19,6 +19,13 @@
 #      視為專案自定義的完整驗證入口）；否則照 v2 跑 lint/typecheck/test，
 #      再否則 fallback prettier --check。
 #
+# v2.2 變更（2026-07-11，Task 5）：Node test script 解析 node --test spec
+#   reporter 的 pass/fail 尾巴——exit 0 但 pass=0 且 fail=0（glob 沒中／全 skip）
+#   視為「0 斷言被驗」擋下；非 spec 格式解析不到時僅 stderr 揭露不擋。
+#   誠實邊界：擋不到「空斷言但 pass=1」的假測試（node --test 算它 pass）——
+#   那是 fresh-verifier 的獵物，非本 hook 能機械偵測。
+#   Python：pytest「無測試」回 exit 5，現行 exit-code 判斷已擋，無需改。
+#
 # 設計理由（沿襲 v2）：
 #   `code/` 是多子專案容器；從工作區根 session 無法可靠推測使用者「正在處理
 #   哪個子專案」，因此採「保守、不誤殺」策略。真正的「完成前驗證」由子專案
@@ -40,6 +47,18 @@ if ($raw) {
 
 $projectDir = $env:CLAUDE_PROJECT_DIR
 if (-not $projectDir) { $projectDir = (Get-Location).Path }
+
+# 解析 node --test spec reporter 尾巴的 pass/fail 計數。
+# 回傳 @{pass;fail} 或 $null（無法解析——非 spec 格式）。
+function Get-NodeTestSummary($output) {
+    $text = ($output | ForEach-Object { "$_" }) -join "`n"
+    $passM = [regex]::Match($text, '(?m)^\D*pass\s+(\d+)\s*$')
+    $failM = [regex]::Match($text, '(?m)^\D*fail\s+(\d+)\s*$')
+    if ($passM.Success -and $failM.Success) {
+        return @{ pass = [int]$passM.Groups[1].Value; fail = [int]$failM.Groups[1].Value }
+    }
+    return $null
+}
 
 $venv = Join-Path $projectDir '.venv\Scripts\python.exe'
 $pkgJson = Join-Path $projectDir 'package.json'
@@ -143,6 +162,18 @@ if (Test-Path -LiteralPath $pkgJson) {
                 $out = & npm run -s $s 2>&1
                 $out | Out-Host
                 if ($LASTEXITCODE -ne 0) { Fail "npm run $s 未通過" $out }
+                # Task 5：test script exit 0 不代表有斷言被驗——node --test 對
+                # 「glob 沒中／全 skip／空測試檔」都回 exit 0。解析 spec reporter
+                # 尾巴（pass N / fail N）：pass=0 且 fail=0 → 0 個斷言被驗，擋下。
+                # 解析不到（非 node --test 格式，如 vitest/jest）→ 不擋，僅 stderr 揭露。
+                if ($s -eq 'test') {
+                    $sum = Get-NodeTestSummary $out
+                    if ($null -eq $sum) {
+                        [Console]::Error.WriteLine('[verify] 注意：test 通過，但無法從輸出解析實跑測試數（非 node --test spec 格式？）——僅以 exit code 判定，未能確認斷言數 > 0，勿僅憑此宣稱「測試全綠」。')
+                    } elseif ($sum.pass -eq 0 -and $sum.fail -eq 0) {
+                        Fail "npm run test 實際驗證 0 個測試（pass=0 fail=0：glob 沒中或全部 skip）——視為未驗證，不予放行" $out
+                    }
+                }
                 $ran = $true
             }
         }

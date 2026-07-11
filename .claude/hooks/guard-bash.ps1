@@ -39,8 +39,42 @@ function Deny([string]$why) {
     exit 2
 }
 
+# flooding 偵測：同一 session 短時間內 ask 過密 → 加警示前綴，對抗確認疲乏
+# （arXiv:2606.08919「審查有容量上限，過度提示更不安全」）。
+# 時間窗設計（非只增不減）：只算最近 N 分鐘；達門檻警示一次後重置。
+# 全程 best-effort——任何錯誤回空字串，絕不影響 ask 決策本身。
+# 計數檔非安全邊界：刪除即重置是可接受行為（它防的是雜訊，不是攻擊）。
+function Get-AskFloodPrefix {
+    try {
+        $sid = $data.session_id
+        if (-not $sid) { $sid = 'no-session' }
+        $sid = ($sid -replace '[^A-Za-z0-9_.-]', '_')
+        $stateDir = $env:GUARD_ASK_STATE_DIR
+        if (-not $stateDir) { $stateDir = Join-Path ([IO.Path]::GetTempPath()) 'claude-guard-ask' }
+        if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+        $threshold = if ($env:GUARD_ASK_THRESHOLD) { [int]$env:GUARD_ASK_THRESHOLD } else { 8 }
+        $windowMin = if ($env:GUARD_ASK_WINDOW_MIN) { [double]$env:GUARD_ASK_WINDOW_MIN } else { 30 }
+        $file = Join-Path $stateDir "$sid.txt"
+        $nowTicks = [DateTime]::UtcNow.Ticks
+        $cutoff = [DateTime]::UtcNow.AddMinutes(-$windowMin).Ticks
+        $stamps = @()
+        if (Test-Path $file) {
+            # 只取合法數字行（壞行不吃掉整個累積），再濾窗口
+            $stamps = @(Get-Content $file | Where-Object { $_.Trim() -match '^\d+$' } |
+                ForEach-Object { [long]$_ } | Where-Object { $_ -ge $cutoff })
+        }
+        $stamps += $nowTicks
+        if ($stamps.Count -ge $threshold) {
+            Set-Content -Path $file -Value '' -Encoding utf8   # 警示後重置（警一次不連環警）
+            return "⚠️ 本 session 近 $windowMin 分鐘內第 $($stamps.Count) 次確認框——留意 rubber-stamp 疲乏，逐字讀這一條再決定，別反射性同意。 "
+        }
+        Set-Content -Path $file -Value ($stamps -join "`n") -Encoding utf8
+        return ''
+    } catch { return '' }
+}
+
 function Ask([string]$why) {
-    $reason = "使用者硬規則「破壞性／難復原動作一律先問」：$why。請確認後再放行。"
+    $reason = (Get-AskFloodPrefix) + "使用者硬規則「破壞性／難復原動作一律先問」：$why。請確認後再放行。"
     $out = @{
         hookSpecificOutput = @{
             hookEventName            = 'PreToolUse'
