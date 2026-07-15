@@ -133,6 +133,24 @@ if (Test-Path -LiteralPath $pkgJson) {
     Write-Host '=== Stop hook (verify-before-done): Node 子專案驗證 ==='
 
     if (-not (Test-Path -LiteralPath (Join-Path $projectDir 'node_modules'))) {
+        # 零相依專案（無 node_modules）：若 test script 是原生 node --test（不需依賴），仍應驗證；
+        # 否則（jest/vitest 等需依賴）維持略過，避免因未 install 誤擋。
+        $testCmd = ''
+        try { $p = Get-Content $pkgJson -Raw | ConvertFrom-Json; $testCmd = "$($p.scripts.test)" } catch { }
+        if ($testCmd -match 'node\s+--test' -or $testCmd -match 'node:test') {
+            Write-Host '--- npm test (零相依 node --test，無 node_modules 仍驗證) ---'
+            Push-Location $projectDir
+            try {
+                $out = & npm run -s test 2>&1
+                $out | Out-Host
+                if ($LASTEXITCODE -ne 0) { Fail 'npm run test 未通過' $out }
+                $sum = Get-NodeTestSummary $out
+                if ($null -ne $sum -and $sum.pass -eq 0 -and $sum.fail -eq 0) {
+                    Fail 'npm run test 實際驗證 0 個測試（pass=0 fail=0：glob 沒中或全部 skip）——視為未驗證' $out
+                }
+            } finally { Pop-Location }
+            exit 0
+        }
         Write-Host 'verify: node_modules 不存在，略過 Node 驗證（請先 pnpm/npm install）。'
         exit 0
     }
