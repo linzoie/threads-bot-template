@@ -90,41 +90,45 @@ if (-not (Test-Path -LiteralPath $gitDir)) { $gitDir = (Get-Location).Path }
 # ──────────────────────────────────────────────────────────────
 # 檢查 1：git add
 # ──────────────────────────────────────────────────────────────
-if ($cmd -imatch 'git\b[^;&|]*\badd\b') {
-    # 取出 add 之後的參數
-    $addPart = ($cmd -split 'git\b[^;&|]*\badd\b', 2, 'IgnoreCase')[1]
-    if ($null -ne $addPart) {
-        $addPart = ($addPart -split '[;&|]')[0]
-        $tokens = ($addPart -split '\s+') | Where-Object { $_ }
-        $isBulk = $false
-        $targets = @()
-        foreach ($tok in $tokens) {
-            $tk = $tok.Trim('"', "'")
-            if ($tk -match '^-(A|a)$|^--all$|^--no-ignore-removal$') { $isBulk = $true; continue }
-            if ($tk -match '^-') { continue }
-            if ($tk -eq '.' -or $tk -eq '*' -or $tk -eq './' ) { $isBulk = $true; continue }
-            $targets += $tk
-        }
+# 先把整條指令切成命令段（; & | 換行皆為邊界），再**只掃真正是 git add 的段**的
+# 參數。避免把後續 `git commit -m "...含 .env 字樣的訊息..."` 當成 add 目標誤判
+# （false positive）；同時逐段掃描仍能抓到 `git add safe（換行）git add .env` 這種
+# 第二個 add 的敏感檔（不製造 false negative）。
+$segments = $cmd -split '[;&|]|\r?\n'
+foreach ($seg in $segments) {
+    if ($seg -inotmatch 'git\b[^\r\n]*\badd\b') { continue }
+    # 取出這一段 add 之後的參數（段內已無 ; & | 換行）
+    $addPart = ($seg -split 'git\b[^\r\n]*\badd\b', 2, 'IgnoreCase')[1]
+    if ($null -eq $addPart) { continue }
+    $tokens = ($addPart -split '\s+') | Where-Object { $_ }
+    $isBulk = $false
+    $targets = @()
+    foreach ($tok in $tokens) {
+        $tk = $tok.Trim('"', "'")
+        if ($tk -match '^-(A|a)$|^--all$|^--no-ignore-removal$') { $isBulk = $true; continue }
+        if ($tk -match '^-') { continue }
+        if ($tk -eq '.' -or $tk -eq '*' -or $tk -eq './' ) { $isBulk = $true; continue }
+        $targets += $tk
+    }
 
-        # 1a) 具名目標直接比對敏感檔名
-        $hits = @($targets | Where-Object { Test-SensitiveName $_ })
-        if ($hits.Count -gt 0) {
-            DenySecrets 'git add 的目標含敏感檔案' $hits
-        }
+    # 1a) 具名目標直接比對敏感檔名
+    $hits = @($targets | Where-Object { Test-SensitiveName $_ })
+    if ($hits.Count -gt 0) {
+        DenySecrets 'git add 的目標含敏感檔案' $hits
+    }
 
-        # 1b) 批次加入（-A / . / *）→ 檢查將被加入的檔案
-        if ($isBulk) {
-            $porcelain = & git -C "$gitDir" status --porcelain -uall 2>$null
-            if ($LASTEXITCODE -eq 0 -and $porcelain) {
-                $pending = @()
-                foreach ($line in $porcelain) {
-                    if ($line.Length -lt 4) { continue }
-                    $p = $line.Substring(3).Trim('"')
-                    if (Test-SensitiveName $p) { $pending += $p }
-                }
-                if ($pending.Count -gt 0) {
-                    DenySecrets 'git add 批次加入將把敏感檔案掃進暫存區（這些檔案未被 .gitignore 忽略！）' $pending
-                }
+    # 1b) 批次加入（-A / . / *）→ 檢查將被加入的檔案
+    if ($isBulk) {
+        $porcelain = & git -C "$gitDir" status --porcelain -uall 2>$null
+        if ($LASTEXITCODE -eq 0 -and $porcelain) {
+            $pending = @()
+            foreach ($line in $porcelain) {
+                if ($line.Length -lt 4) { continue }
+                $p = $line.Substring(3).Trim('"')
+                if (Test-SensitiveName $p) { $pending += $p }
+            }
+            if ($pending.Count -gt 0) {
+                DenySecrets 'git add 批次加入將把敏感檔案掃進暫存區（這些檔案未被 .gitignore 忽略！）' $pending
             }
         }
     }
