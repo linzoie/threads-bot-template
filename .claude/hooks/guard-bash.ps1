@@ -171,8 +171,11 @@ function Get-DeleteClassification([string]$segment) {
     return 'ask'
 }
 
-# 以 ; && || | 切段，逐段檢查刪除指令
-$segments = [regex]::Split($cmd, '\s*(?:;|&&|\|\||\|)\s*')
+# 以 ; && || | 及單一 & 切段，逐段檢查刪除指令
+# （2026-07-24：補單一 & 繞法——`echo hi & rm -rf /` 在 bash（背景符）與 cmd（串接符）下都會執行，
+#  原 splitter 漏切單 &，使 echo 前綴把整段當非刪除放行。&(?!&) 只切單 &、不誤切 &&；
+#  denyPatterns 對整串 $cmd 比對故不受影響，本切段只餵刪除分類器。）
+$segments = [regex]::Split($cmd, '\s*(?:;|&&|\|\||\||&(?!&))\s*')
 foreach ($seg in $segments) {
     $cls = Get-DeleteClassification $seg
     if ($cls -eq 'deny')  { Deny  "遞迴刪除根目錄／家目錄／整個目前目錄（$($seg.Trim())）" }

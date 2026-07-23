@@ -1,0 +1,17 @@
+{
+  "_comment": "Antigravity PreToolUse 守門。由 sync-governance.ps1 從 project-template/.agents 推送到各子專案。antigravity-guard.ps1 在同目錄（.agents/），Antigravity 以 hooks.json 所在目錄解析相對路徑（2026-07-24 契約實測：guard 腳本與 hooks.json 同置 .agents/、bare 檔名可被呼叫）。守門只在該子專案被登記為 Antigravity workspace 時生效。",
+  "antigravity-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File antigravity-guard.ps1",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

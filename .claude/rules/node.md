@@ -20,7 +20,9 @@ paths:
   無 test script 的專案：Stop hook 只驗格式（**綠燈只代表格式對、不代表行為對**），
   改動涉及邏輯時必須手動實跑或補測試，勿僅憑 hook 放行宣稱完成。
 - 有 build（vite/自製 build.mjs）→ 手動確認產出正常（Stop hook 因耗時未納入）。
-- 完成門檻：測試綠（若有）+ prettier 綠 + 跑得起來的功能用實際執行確認（UI 工具要眼睛看）。
+- 有 `lint` script（eslint）→ **0 errors** 才算完成（抓孤兒 import／未用變數；
+  僅已有 devDeps 的專案逐案引入，「零相依」專案不為此破戒——2026-07-21 裁定）。
+- 完成門檻：測試綠（若有）+ prettier 綠 + lint 綠（若有）+ 跑得起來的功能用實際執行確認（UI 工具要眼睛看）。
 
 ## 慣例
 
