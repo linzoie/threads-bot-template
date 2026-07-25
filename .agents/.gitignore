@@ -1,0 +1,2 @@
+# Antigravity 守門的執行期 log（每次 hook 被呼叫時寫入）——不進版控
+hook-calls.log
