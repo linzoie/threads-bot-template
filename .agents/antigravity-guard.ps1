@@ -48,7 +48,16 @@
 # ============================================================
 $ErrorActionPreference = 'SilentlyContinue'
 
-$logPath = Join-Path $PSScriptRoot 'hook-calls.log'
+# log 位置預設在本檔同目錄；`AGY_HOOK_LOG_DIR` 可覆寫（2026-07-27 紅隊 major 修）。
+# 起因：probe-guards.ps1 的探測會逐專案跑這支，把合成的 stepIdx=-1 記錄寫進**各專案
+# 真實的 hook-calls.log**，與真實 Antigravity 流量交錯。而本檔第 39-41 行明文設計
+# 「log 空 = hook 沒被呼叫」這條診斷——跑過一次探針之後，任何專案的 log 都不可能再是空的，
+# 該診斷永久失效。環境變數只用於探測/測試，Antigravity 正式呼叫時不設＝行為不變。
+$logDir = if ($env:AGY_HOOK_LOG_DIR) { $env:AGY_HOOK_LOG_DIR } else { $PSScriptRoot }
+if ($env:AGY_HOOK_LOG_DIR -and -not (Test-Path $logDir)) {
+    try { New-Item -ItemType Directory -Path $logDir -Force | Out-Null } catch {}
+}
+$logPath = Join-Path $logDir 'hook-calls.log'
 function Write-HookLog([string]$m) {
     # 遮罩（2026-07-26 紅隊 F5）：本 log 逐字記錄完整指令列，指令內嵌的 token／金鑰會落地成
     # 明文。.agents/.gitignore 已排除 *.log（實測 sync 會散佈該 .gitignore），所以不會進版控，
