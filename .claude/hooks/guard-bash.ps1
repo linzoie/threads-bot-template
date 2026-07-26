@@ -15,8 +15,16 @@
 #   - ask ：permissionDecision "ask"（使用者「破壞性／難復原一律先問」清單）
 #   - pass：exit 0
 #
-# 解析失敗一律 fail-open（exit 0）。core 找不到亦 fail-open（縱深防禦、不 brick；
-# Phase 3 會升級為 hash-pin + fail-visible）。
+# stdin 解析失敗一律 fail-open（exit 0）——沒有指令可判，不是防護失效。
+#
+# **core 載入失敗＝fail-visible ASK，不是 fail-open**（2026-07-26 紅隊實測後改）：
+#   舊版只用 `Test-Path` 判斷 core 在不在，而且 $ErrorActionPreference='SilentlyContinue'
+#   會吞掉 dot-source 的錯誤 → core「存在但壞掉」時 Get-GuardVerdict 未定義、$verdict 為
+#   $null、switch 落到 default → **exit 0 放行一切**。實測 core 語法錯／無函式／0 byte
+#   三種情境下 `rm -rf /` 全部被放行（見 .governance/tests/test-core-degraded.ps1）。
+#   現在改成：載入失敗或判定無效 → 走 Fail-Visible（permissionDecision "ask" + 顯眼理由
+#   + GovLog），使用者一定看得到。用 ask 不用 deny 的理由：guard-bash 掛在全域，deny
+#   會讓整台機器所有指令都被硬擋（brick）；ask 停得下來又留得下人工放行的路。
 # ============================================================
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -28,10 +36,9 @@ try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
 $cmd = $data.tool_input.command
 if (-not $cmd) { exit 0 }
 
-# 2) dot-source 共用判定核心（同目錄）。找不到 → fail-open（不 brick agent）。
+# 2) 共用判定核心的載入移到下方「3)」——必須在 Deny/Ask/Fail-Visible 函式定義之後，
+#    載入失敗才有辦法用 Ask 通報使用者（舊版在此處 exit 0，正是靜默 fail-open 的成因）。
 $corePath = Join-Path $PSScriptRoot 'guard-core.ps1'
-if (-not (Test-Path $corePath)) { exit 0 }
-. $corePath
 
 # ──────────────────────────────────────────────────────────────
 # 以下為 Claude 側呈現層（留在 shim，不進 core）：
@@ -103,10 +110,29 @@ function Ask([string]$why) {
     exit 0
 }
 
-# 3) 委派共用核心判定，映射到 Claude 輸出
+# Fail-Visible：判定核心不可用時的通報路徑。**絕不 exit 0**——那是舊版的靜默 fail-open。
+# 用 Ask 而非 Deny：guard-bash 也掛在全域 ~/.claude，Deny 會讓整台機器所有指令被硬擋。
+function FailVisible([string]$why) {
+    Write-GovLog 'guard-bash' 'core-unavailable' $why
+    Ask "⚠️ guard 判定核心不可用（$why）——**本次指令未經安全判定**。請先修復：跑 ``pwsh .governance/bin/governance-doctor.ps1`` 查漂移、``pwsh .governance/bin/sync-governance.ps1`` 重新散佈。在修好之前，請自行確認這條指令安全"
+}
+
+# 3) 載入共用判定核心並硬斷言（三道，缺一都會退回靜默放行）
+#    (a) 檔案存在  (b) dot-source 沒拋錯（try/catch，不靠 SilentlyContinue 吞）
+#    (c) Get-GuardVerdict 真的被定義出來（語法壞掉/空檔時檔案在、函式不在）
+if (-not (Test-Path $corePath)) { FailVisible '找不到 guard-core.ps1' }
+try { . $corePath } catch { FailVisible "guard-core.ps1 載入失敗：$($_.Exception.Message)" }
+if (-not (Get-Command Get-GuardVerdict -ErrorAction SilentlyContinue)) {
+    FailVisible 'guard-core.ps1 已載入但未定義 Get-GuardVerdict（檔案可能損毀或被截斷）'
+}
+
+# 4) 委派判定，映射到 Claude 輸出
 $verdict = Get-GuardVerdict -Command $cmd
+# (d) 判定結果本身也要驗——core 內部若拋錯被吞，可能回 $null 或缺 decision 欄位
+if ($null -eq $verdict -or -not $verdict.decision) { FailVisible 'guard-core 回傳無效判定（null 或缺 decision 欄位）' }
 switch ($verdict.decision) {
     'deny'  { Deny $verdict.why }
     'ask'   { Ask  $verdict.why }
-    default { exit 0 }
+    'pass'  { exit 0 }
+    default { FailVisible "guard-core 回傳未知判定值 '$($verdict.decision)'" }
 }
