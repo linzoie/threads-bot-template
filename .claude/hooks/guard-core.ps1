@@ -147,6 +147,19 @@ function Get-GuardVerdictSingle {
         @{ rx = '\bmkfs(\.|\s)';                    why = '格式化檔案系統' },
         @{ rx = '\bdd\s+[^;&|]*of=/dev/';           why = 'dd 直接寫入磁碟裝置' },
         @{ rx = 'format-volume|clear-disk|initialize-disk'; why = 'PowerShell 磁碟格式化／清除' },
+        # 2026-07-26（Antigravity adapter 對等化）：以下三條原本只存在於 .agents/antigravity-guard.ps1
+        # 的自含 deny 清單。把該檔改成薄 shim 之前必須先補進 core，否則這些指令會從「現行 deny」
+        # 退化成「完全放行」（實測 pass，見交接紀錄）。補進 core 而非 shim ＝ 三家 adapter 共同受益。
+        #
+        # (1) legacy `format <碟>:`（cmd 的格式化指令；core 原本只認 format-volume/clear-disk）。
+        #     **必須錨定段首**：不錨定會誤殺 `dotnet format C:\repo\x.sln`（實測該字串含 "format C:"）。
+        #     `[A-Za-z]:\\?(\s|$)` 要求磁碟代號就是整個目標——後面接路徑（C:\repo\…）即不命中。
+        @{ rx = '(^|[;&|])\s*format(\.com)?\s+(/\S+\s+)*[A-Za-z]:\\?(\s|$)'; why = 'legacy format <磁碟>:（格式化整顆磁碟）' },
+        # (2) 重導直接寫入區塊裝置（core 原本只認 `dd … of=/dev/`，一般 `> /dev/sda` 完全放行）。
+        #     只列真實區塊裝置名，故 `> /dev/null`／`/dev/stdout`／`/dev/tty` 不受影響。
+        @{ rx = '>>?\s*/dev/(sd[a-z]|hd[a-z]|vd[a-z]|xvd[a-z]|nvme\d|mmcblk\d|disk\d)'; why = '重導直接寫入區塊裝置（毀磁碟）' },
+        # (3) Windows 原生裸磁碟路徑（`of=\\.\PhysicalDrive0`）——posix `/dev/` 在 Windows 的對應寫法。
+        @{ rx = '\bdd\b[^;&|]*of=\\\\[.?]\\physicaldrive'; why = 'dd 直接寫入 Windows 實體磁碟（\\.\PhysicalDriveN）' },
         @{ rx = ':\(\)\s*\{\s*:\s*\|\s*:';          why = 'fork bomb' },
         # 機密外洩（2026-07-11 依社群研究補；deny 級連 --dangerously-skip-permissions 都擋得住）：
         # 把機密檔上傳到網路——幾乎無正當日常用途
@@ -260,8 +273,13 @@ function Get-GuardVerdictSingle {
         @{ rx = '\bnpx\s+[^;&|]*(https?://|github:)'; why = 'npx 執行遠端套件（供應鏈風險）' },
         @{ rx = '\bpip[0-9.]*\s+install\s+[^;&|]*(git\+|https?://)'; why = 'pip 從 URL/git 安裝（供應鏈風險）' },
         @{ rx = 'core\.hookspath';                    why = '設定 git core.hooksPath（可能劫持 git hooks）' },
-        @{ rx = '(curl|wget|iwr|invoke-webrequest)\b[^;&|]*\|\s*(ba|z|da)?sh\b'; why = '下載內容直接餵給 shell 執行（供應鏈風險）' },
-        @{ rx = '(iwr|invoke-webrequest|downloadstring)[^;&|]*\|\s*iex\b';       why = '下載內容直接 Invoke-Expression（供應鏈風險）' },
+        # 2026-07-26（Antigravity adapter 對等化）：原兩條的殼清單漏了 Windows 上最自然的
+        # `| powershell` / `| pwsh`，iex 那條又只認 iwr/downloadstring 家族——實測
+        # `curl … | powershell`、`curl … | pwsh`、`curl … | iex`、`iwr … | Invoke-Expression`
+        # 四種全部 pass（零攔截）。antigravity-guard 自含清單原本擋得住，改薄 shim 前先補進 core。
+        # 維持 ask 不升 deny：與同組供應鏈規則（`curl | sh`）同級處置，避免同類風險兩種處置。
+        @{ rx = '(curl|wget|iwr|invoke-webrequest)\b[^;&|]*\|\s*((ba|z|da)?sh|pwsh|powershell)(\.exe)?\b'; why = '下載內容直接餵給 shell 執行（供應鏈風險）' },
+        @{ rx = '(curl|wget|iwr|invoke-webrequest|downloadstring)\b[^;&|]*\|\s*(iex|invoke-expression)\b'; why = '下載內容直接 Invoke-Expression（供應鏈風險）' },
         # A2b 延伸（2026-07-11）：解碼器/產生器管道餵 shell（混淆執行）→ ASK
         @{ rx = '(base64\s+-d|base64\s+--decode|xxd\s+-r|printf\b)[^;&|]*\|\s*(ba|z|da)?sh\b'; why = 'base64/printf 等解碼產生後直接餵 shell 執行（混淆式供應鏈風險）' },
         # 2026-07-25：PowerShell -EncodedCommand（base64 payload）——內容靜態不可判定，
