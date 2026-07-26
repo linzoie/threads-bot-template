@@ -185,7 +185,13 @@ function Get-GuardVerdictSingle {
             -and $cmd -inotmatch '\.env\.(example|sample|template)\b') {
         return @{ decision = 'ask'; why = '讀取 .env（可能含 token／金鑰，輸出恐外流）' }
     }
-    if ($cmd -imatch '(^|[\s;&|])(cat|type|bat|get-content|gc)\b[^;&|]*(id_rsa|id_ed25519|id_ecdsa|\.pem\b|\.pfx\b|\.p12\b|(?<!\.pub)\.key\b|credentials[^;&|]*\.json|secrets?\.(json|ya?ml|toml))' `
+    # 2026-07-26 裁決：補 auth.json（各家 CLI 的 OAuth token 慣用檔名，如 ~/.codex/auth.json），
+    # **維持 ask 不升 deny**——同組機密（.env／私鑰／credentials）都是 ask，只升一條會造成
+    # 「同類風險兩種處置」的內部不一致，那正是 policy 分岔的起點。deny 的摩擦成本也被低估：
+    # deny 是硬擋、連 --dangerously-skip-permissions 都繞不過，除錯時只能改 hook，而「養成改
+    # hook 的習慣」比偶爾多按一次確認危險得多。
+    # 註：`\bauth\.json` 的 \b 不會誤命中 oauth.json（o 與 a 之間無詞界）。
+    if ($cmd -imatch '(^|[\s;&|])(cat|type|bat|get-content|gc)\b[^;&|]*(id_rsa|id_ed25519|id_ecdsa|\.pem\b|\.pfx\b|\.p12\b|(?<!\.pub)\.key\b|credentials[^;&|]*\.json|\bauth\.json|secrets?\.(json|ya?ml|toml))' `
             -and $cmd -inotmatch '\.(pub|example|sample|template)\b') {
         return @{ decision = 'ask'; why = '讀取私鑰／憑證／機密檔（輸出恐外流）' }
     }
