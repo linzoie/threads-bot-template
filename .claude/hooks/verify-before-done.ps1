@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # ============================================================
 # verify-before-done.ps1  —  Stop hook
 #
@@ -60,7 +60,20 @@ function Get-NodeTestSummary($output) {
     return $null
 }
 
-$venv = Join-Path $projectDir '.venv\Scripts\python.exe'
+# 跨 OS venv 工具解析（2026-07-29 Phase 2-2）：Windows 是 .venv\Scripts\x.exe、
+# macOS/Linux 是 .venv/bin/x（無副檔名）。舊版只寫死 Windows 佈局，在 Mac 上
+# Test-Path 恆為 false → **所有 Python 檢查靜默跳過**（Stop hook 看似在跑、
+# 實際沒把關）。回傳第一個實際存在的候選；找不到回 $null，維持原本「工具不在就略過」語意。
+function Resolve-VenvTool([string]$projectDir, [string]$name) {
+    $candidates = @(
+        (Join-Path $projectDir (Join-Path '.venv' (Join-Path 'Scripts' ($name + '.exe')))),
+        (Join-Path $projectDir (Join-Path '.venv' (Join-Path 'bin' $name)))
+    )
+    foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
+    return $null
+}
+
+$venv = Resolve-VenvTool $projectDir 'python'
 $pkgJson = Join-Path $projectDir 'package.json'
 
 # 失敗回報：摘要 + 該檢查輸出的最後 40 行 → stderr（Claude 看得到）
@@ -79,12 +92,12 @@ function Fail([string]$summary, $output) {
 # ──────────────────────────────────────────────────────────────
 # 情境 1：session 根就是一個 Python 子專案（有 .venv\Scripts\python.exe）
 # ──────────────────────────────────────────────────────────────
-if (Test-Path -LiteralPath $venv) {
+if ($venv -and (Test-Path -LiteralPath $venv)) {
     Write-Host '=== Stop hook (verify-before-done): Python 子專案驗證 ==='
 
     # 1a) ruff lint
-    $ruff = Join-Path $projectDir '.venv\Scripts\ruff.exe'
-    if (Test-Path -LiteralPath $ruff) {
+    $ruff = Resolve-VenvTool $projectDir 'ruff'
+    if ($ruff -and (Test-Path -LiteralPath $ruff)) {
         Write-Host '--- ruff check ---'
         $out = & $ruff check -- "$projectDir" 2>&1
         $out | Out-Host
@@ -92,8 +105,8 @@ if (Test-Path -LiteralPath $venv) {
     }
 
     # 1b) 型別檢查（若 mypy 存在）
-    $mypy = Join-Path $projectDir '.venv\Scripts\mypy.exe'
-    if (Test-Path -LiteralPath $mypy) {
+    $mypy = Resolve-VenvTool $projectDir 'mypy'
+    if ($mypy -and (Test-Path -LiteralPath $mypy)) {
         Write-Host '--- mypy ---'
         $out = & $mypy "$projectDir" 2>&1
         $out | Out-Host
@@ -113,8 +126,8 @@ if (Test-Path -LiteralPath $venv) {
     }
 
     # 1d) pytest（若存在）
-    $pytest = Join-Path $projectDir '.venv\Scripts\pytest.exe'
-    if (Test-Path -LiteralPath $pytest) {
+    $pytest = Resolve-VenvTool $projectDir 'pytest'
+    if ($pytest -and (Test-Path -LiteralPath $pytest)) {
         Write-Host '--- pytest ---'
         $out = & $pytest -q "$projectDir" 2>&1
         $out | Out-Host

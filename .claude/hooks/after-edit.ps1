@@ -40,12 +40,28 @@ function Find-Up([string]$startDir, [string]$relativeMarker) {
     return $null
 }
 
+# 3b) 跨 OS 佈局解析（2026-07-29 Phase 2-2）：同一個工具在兩種平台的相對路徑不同——
+#     Windows：.venv\Scripts\ruff.exe、node_modules\.bin\prettier.cmd
+#     macOS/Linux：.venv/bin/ruff、node_modules/.bin/prettier（無副檔名）
+#     舊版只寫死 Windows 佈局，在 Mac 上 Test-Path 恆為 false → **靜默略過所有
+#     format/lint**（hook 看起來在跑、實際沒把關）。逐一嘗試候選、取第一個存在者。
+function Find-Up-Any([string]$startDir, [string[]]$relativeMarkers) {
+    foreach ($m in $relativeMarkers) {
+        $hit = Find-Up $startDir $m
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
 $fileDir = Split-Path -Parent $file
 $ext = [System.IO.Path]::GetExtension($file).ToLower()
 
-# 4) Python -> ruff（找最近的 .venv\Scripts\ruff.exe，再 fallback 全域 ruff）
+# 4) Python -> ruff（找最近的 venv 內 ruff，再 fallback 全域 ruff）
 if ($ext -eq '.py') {
-    $ruff = Find-Up $fileDir '.venv\Scripts\ruff.exe'
+    $ruff = Find-Up-Any $fileDir @(
+        (Join-Path '.venv' (Join-Path 'Scripts' 'ruff.exe')),   # Windows
+        (Join-Path '.venv' (Join-Path 'bin' 'ruff'))            # macOS/Linux
+    )
     if (-not $ruff) {
         if (Get-Command ruff -ErrorAction SilentlyContinue) { $ruff = 'ruff' }
     }
@@ -55,11 +71,14 @@ if ($ext -eq '.py') {
     exit 0
 }
 
-# 5) Node / 前端 -> prettier（找最近的 node_modules\.bin\prettier.cmd）
+# 5) Node / 前端 -> prettier（找最近的 node_modules 內 prettier）
 $nodeExts = @('.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx', '.json',
               '.css', '.scss', '.html', '.md', '.yml', '.yaml')
 if ($nodeExts -contains $ext) {
-    $prettier = Find-Up $fileDir 'node_modules\.bin\prettier.cmd'
+    $prettier = Find-Up-Any $fileDir @(
+        (Join-Path 'node_modules' (Join-Path '.bin' 'prettier.cmd')),  # Windows
+        (Join-Path 'node_modules' (Join-Path '.bin' 'prettier'))       # macOS/Linux
+    )
     if (-not $prettier) { Write-Host 'after-edit: prettier 未找到，略過'; exit 0 }
     & $prettier --write --log-level warn -- "$file" 2>&1 | Out-Host
     exit 0
