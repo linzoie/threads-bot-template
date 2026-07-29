@@ -1,0 +1,13 @@
+# 行尾正規化 —— 防 CRLF/LF 漂移（工作區 2026-07 實際踩過：hook 假漂移、dist 假變更）
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.xlsx binary
+*.zip binary
