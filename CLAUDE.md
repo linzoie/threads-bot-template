@@ -1,3 +1,5 @@
+@AGENTS.md
+
 @../CLAUDE.md
 
 # threads-bot-template（公開教學範本）
