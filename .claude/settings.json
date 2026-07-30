@@ -34,7 +34,7 @@
         ]
       },
       {
-        "matcher": "mcp__.*|WebFetch",
+        "matcher": "^(mcp__.*|WebFetch)$",
         "hooks": [
           {
             "type": "command",
@@ -50,6 +50,15 @@
           {
             "type": "command",
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/after-edit.ps1\""
+          }
+        ]
+      },
+      {
+        "matcher": "^WebFetch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/record-webfetch.ps1\""
           }
         ]
       }
