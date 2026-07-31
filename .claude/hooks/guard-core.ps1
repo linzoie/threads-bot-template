@@ -285,7 +285,10 @@ function Get-GuardVerdictSingle {
         # 2026-07-25：PowerShell -EncodedCommand（base64 payload）——內容靜態不可判定，
         # 展開層也看不進去（實測 V1/V2 皆放行）。不解碼、只看旗標，一律 ask。
         # 取捨：合法的編碼呼叫也會被問一次；相對於「任意指令零攔截」這是划算的。
-        @{ rx = '\b(powershell|pwsh)(\.exe)?\b[^;&|]*\s-(e|ec|enc|encoded|encodedcommand)\b'; why = 'PowerShell -EncodedCommand（base64 指令，內容不可靜態判定）' }
+        @{ rx = '\b(powershell|pwsh)(\.exe)?\b[^;&|]*\s-(e|ec|enc|encoded|encodedcommand)\b'; why = 'PowerShell -EncodedCommand（base64 指令，內容不可靜態判定）' },
+        # 2026-07-31（settings.local 破口同批）：--settings 指定外部設定檔＝第四種設定載體，
+        # 可載入未受 guard-write 保護、未進版控的 permissions/hooks/env。與 protectRx 三載體同壘。
+        @{ rx = '\bclaude(\.exe|\.cmd)?\b[^;&|]*\s--settings\b'; why = 'claude --settings 指定外部設定檔（繞過版控 settings 的第四種載體，先確認來源）' }
     )
     foreach ($p in $askPatterns) {
         if ($cmd -imatch $p.rx) { return @{ decision = 'ask'; why = $p.why } }

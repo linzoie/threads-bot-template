@@ -32,7 +32,9 @@ if ($cmd -inotmatch 'git\b[^;&|]*\b(add|commit)\b') { exit 0 }
 # outcome 觀測（2026-07-11）：記 deny 到 governance-logs（不記檔名/內容，避免洩密）。fail-open。
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     try {
-        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，防守門 log 被導走）
+        $dir = Join-Path $HOME '.claude\governance-logs'
+        if ($env:GOVLOG_DIR) { try { $c = [IO.Path]::GetFullPath($env:GOVLOG_DIR); if ($c.StartsWith([IO.Path]::GetFullPath(([IO.Path]::GetTempPath())), [System.StringComparison]::OrdinalIgnoreCase)) { $dir = $c } } catch { } }
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
         $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress

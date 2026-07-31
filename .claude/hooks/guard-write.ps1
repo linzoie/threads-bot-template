@@ -6,7 +6,9 @@
 # governance 檔」而**靜默自我繳械**（例如在 guard-bash.ps1 頂端插 exit 0，
 # 下個 session 重啟後全線放行）。命中受保護路徑 → ASK（強制使用者確認）。
 #
-# 受保護：.claude/{hooks,agents}/、任何 settings.json、
+# 受保護：.claude/{hooks,agents}/、任何 settings.json／settings.local.json／
+#         managed-settings.json（三種載體同享 permissions/hooks/env 效力，缺一即繞道
+#         ——settings.local.json 曾是零確認框自我核准通道，2026-07-31 補），
 #         .governance/{project-template,bin,tests}/（執行邏輯與其來源/散佈/測試）。
 #   （.governance/{reports,golden-tasks,handoff} 屬文件、頻繁編輯，不保護。）
 #
@@ -25,12 +27,14 @@ $fp = $data.tool_input.file_path
 if (-not $fp) { exit 0 }
 
 # 反斜線與正斜線都要涵蓋（Windows 上 file_path 為反斜線——這是 S4a 的關鍵）
-$protectRx = '[\\/]\.claude[\\/](hooks|agents)[\\/]|[\\/]settings\.json$|[\\/]\.governance[\\/](project-template|bin|tests)[\\/]'
+$protectRx = '[\\/]\.claude[\\/](hooks|agents)[\\/]|[\\/](managed-)?settings(\.local)?\.json$|[\\/]\.governance[\\/](project-template|bin|tests)[\\/]'
 
 # outcome 觀測（2026-07-11）：記 ask 到 governance-logs。fail-open。
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     try {
-        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，防守門 log 被導走）
+        $dir = Join-Path $HOME '.claude\governance-logs'
+        if ($env:GOVLOG_DIR) { try { $c = [IO.Path]::GetFullPath($env:GOVLOG_DIR); if ($c.StartsWith([IO.Path]::GetFullPath(([IO.Path]::GetTempPath())), [System.StringComparison]::OrdinalIgnoreCase)) { $dir = $c } } catch { } }
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
         $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress

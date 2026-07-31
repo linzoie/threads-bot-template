@@ -62,6 +62,13 @@
 # 解析失敗一律 fail-open（exit 0）——不因 hook 自身錯誤卡住工具（僅適用 stdin/JSON 層，
 # 見上方分流說明；WebFetch 的 URL 層是 fail-closed）。
 # ============================================================
+# 2026-07-31（settings-env 不可信輸入加固）：測試注入從環境變數改為 CLI 參數。
+# settings.json／settings.local.json 的 env 區塊會注入 hook 子行程環境＝env 可被
+# 任何能寫 settings*.json 的行為者偽造；但 production 接線（settings 的 hooks 陣列）
+# 只餵 stdin、不帶參數，CLI 參數注入不進來。test-mcp-guard.ps1 是唯一合法呼叫者。
+param(
+    [string]$TestAllowlistExtra = ''
+)
 $ErrorActionPreference = 'SilentlyContinue'
 
 $raw = [Console]::In.ReadToEnd()
@@ -71,10 +78,24 @@ try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
 $tool = $data.tool_name
 if (-not $tool) { exit 0 }
 
+# 2026-07-31：env 目錄重導向只接受 TEMP 底下的路徑（測試／探針隔離是唯一正當用途，
+# run-all／test-mcp-guard／probe-guards 全都指向 TEMP）。settings 的 env 區塊是 hook 的
+# 隱性不可信輸入——TEMP 白名單讓「把守門 log 導去別處藏」「預埋 state 目錄」失效；
+# TEMP 內的殘餘操縱空間與檔頭威脅模型已列的既知繞法等價，不新增攻擊面。
+function Resolve-TempScopedDir([string]$candidate, [string]$fallback) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $fallback }
+    try {
+        $full = [IO.Path]::GetFullPath($candidate)
+        $tmpRoot = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()))
+        if ($full.StartsWith($tmpRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $full }
+    } catch { }
+    return $fallback
+}
+
 # outcome 觀測（2026-07-11）：記 ask 到 governance-logs（記 tool_name，屬非機密）。fail-open。
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     try {
-        $dir = if ($env:GOVLOG_DIR) { $env:GOVLOG_DIR } else { Join-Path $HOME '.claude\governance-logs' }
+        $dir = Resolve-TempScopedDir $env:GOVLOG_DIR (Join-Path $HOME '.claude\governance-logs')
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
         $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress
@@ -110,12 +131,14 @@ $script:DedupAllowlistHosts = @(
     'developers.line.biz', 'obsidian.md', 'help.obsidian.md', 'law.moj.gov.tw',
     'developers.openai.com', 'docs.github.com'
 )
-# 測試專用擴充（正式環境不設此變數＝無作用；精確比對，不做 suffix）。設計對齊
-# 既有的 GUARD_WEBFETCH_STATE_DIR／GOVLOG_DIR 環境變數測試注入慣例——讓
-# test-mcp-guard.ps1 能在不碰動這份正式白名單內容的前提下，用合成測試網域驗證
+# 測試專用擴充（**只走 CLI 參數 -TestAllowlistExtra**；正式接線不帶參數＝無作用；
+# 精確比對，不做 suffix）。2026-07-31 起不再讀 GUARD_WEBFETCH_ALLOWLIST_EXTRA 環境
+# 變數——settings 的 env 區塊可注入 hook 子行程，env 版等於把白名單交給任何能寫
+# settings*.json 的行為者（golden-task 2026-07-31-settings-local-json-governance-gap）。
+# 讓 test-mcp-guard.ps1 能在不碰動正式白名單內容的前提下，用合成測試網域驗證
 # 白名單以下各層（安全網／結構檢查／state 比對）的邏輯本身。
-if ($env:GUARD_WEBFETCH_ALLOWLIST_EXTRA) {
-    $extra = @($env:GUARD_WEBFETCH_ALLOWLIST_EXTRA -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+if ($TestAllowlistExtra) {
+    $extra = @($TestAllowlistExtra -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
     $script:DedupAllowlistHosts = @($script:DedupAllowlistHosts) + $extra
 }
 function Test-DedupAllowlistHost([string]$h) {
@@ -202,11 +225,10 @@ function Test-NeverDedupHost([string]$h) {
 # 四門檻（見交付說明量測 (b)）：24→13.9% 節省率／166 次被擋，48→19.1%／37 次，
 # 64→20.1%／9 次，96→20.5%／1 次（64→96 邊際增益僅 0.4 個百分點）。採 64 為預設
 # （可用環境變數覆寫供測試使用，正式環境不設＝用 64）。
-if ($env:GUARD_WEBFETCH_PATH_SEGLEN_THRESHOLD) {
-    $script:DedupPathSegLenThreshold = [int]$env:GUARD_WEBFETCH_PATH_SEGLEN_THRESHOLD
-} else {
-    $script:DedupPathSegLenThreshold = 64
-}
+# 2026-07-31：門檻寫死（原 GUARD_WEBFETCH_PATH_SEGLEN_THRESHOLD env 覆寫已移除——
+# 全 repo 無任何測試使用它，而 env 可被 settings 注入直接放寬外送門檻）。要改門檻
+# 改這一行，並重跑真實語料量測（見上方 §2.6 註解的 24/48/64/96 掃描方法）。
+$script:DedupPathSegLenThreshold = 64
 function Test-DedupEligible([System.Uri]$uri, [string]$rawUrl) {
     if ($uri.UserInfo) { return $false }
     if ($uri.Query -and $uri.Query -ne '?') { return $false }
@@ -258,7 +280,8 @@ if ($tool -eq 'WebFetch') {
     $sid = $data.session_id
     if (-not [string]::IsNullOrWhiteSpace($sid)) {
         $sidSan = ($sid -replace '[^A-Za-z0-9_.-]', '_')
-        $stateDir = if ($env:GUARD_WEBFETCH_STATE_DIR) { $env:GUARD_WEBFETCH_STATE_DIR } else { Join-Path ([IO.Path]::GetTempPath()) 'claude-guard-webfetch' }
+        # 2026-07-31：state 目錄重導向限 TEMP（見 Resolve-TempScopedDir 註解）
+        $stateDir = Resolve-TempScopedDir $env:GUARD_WEBFETCH_STATE_DIR (Join-Path ([IO.Path]::GetTempPath()) 'claude-guard-webfetch')
         $stateFile = Join-Path $stateDir "$sidSan.txt"
         if (Test-Path $stateFile) {
             # 【TTL，C+ 新增】state 檔 mtime 超過 24 小時即整份作廢——`--resume` 會
