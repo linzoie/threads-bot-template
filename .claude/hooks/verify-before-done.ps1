@@ -230,9 +230,97 @@ if (Test-Path -LiteralPath $pkgJson) {
 }
 
 # ──────────────────────────────────────────────────────────────
+# 跨 repo git 落點摘要（2026-08-01 加）
+#
+# 為什麼掛在情境 3：這裡＝session 在多子專案工作區根，正是**跨 repo 批次操作**
+# 發生的地方；在單一子專案內工作的 session 不會付這個成本。
+#
+# 動機（真實事故，同一天兩起）：
+#   ① 對 16 個 repo 跑迴圈 git commit，**沒查各自在哪條分支**——其中一個
+#      checkout 在 feature 分支上，那個 commit 就落在該分支而非 main。
+#      16 次 commit 全部 exit 0，事後的驗證迴圈也全綠，因為驗證用的是
+#      `git log -1 -- <file>`（對 HEAD 問）——**驗證與動作共用同一個隱含框架**，
+#      偵測不到那個框架被違反。
+#   ② 隨後憑記憶回報「15 個 repo 未推」，實際是 0（其他 session 已推掉）。
+#
+# 兩起都是「**關於外部狀態的宣稱**」。這類宣稱的重查成本是零且冪等，所以正確的
+# 機制不是提醒模型去查（工作區已有數十條規則，其中一條逐字寫著
+# `git branch --show-current`，三天新、沒觸發），而是**不等它開口就把事實放到面前**。
+# 供給事實 ≠ 稽核宣稱：前者不需要跟其他規則搶注意力，因為它不是原則，是結果。
+#
+# 為何純檔案讀而不呼叫 git —— 實測（2026-08-01，16 repos，各三次）：
+#   每 repo 3 次 git 子行程： 3,815 / 6,151 / 9,395 ms  → **出局**
+#   直讀 .git/HEAD + refs：      57 /    76 /   141 ms  → 採用（約 60 倍）
+# 兩者對同一份資料得出的結論完全一致（都標出 invest-hub / iv-tracker / tt-screener）。
+# Stop hook 每回合都跑，秒級延遲的 hook 必然被使用者關掉——detect-unread-claim.ps1
+# 檔頭記過同一個教訓（10,008ms 的放行路徑）。
+#
+# 誠實限制（不宣稱超出證據的事）：
+#   ・「本機 ref ≠ remote-tracking ref」只說明**不同步**，給不出方向與數量。
+#     對「我剛 commit 到奇怪的地方」夠用（commit 必定改動本機 ref）；
+#     對「我落後遠端多少」不準（remote-tracking 只有上次 fetch 那麼新）——故不報。
+#   ・`.git` 是檔案而非目錄時（worktree／submodule）直接略過，不猜。
+#   ・reftable 等新格式解析不到 → 會落到「無 upstream」，**往吵的方向失敗**，
+#     不會靜默隱藏異常。
+#   ・全程 try/catch 靜默：這是 Stop hook，任何失敗都不得中斷 session、不得擋。
+#   ・**全部正常時完全不輸出**——常態噪音會訓練人忽略它。
+# ──────────────────────────────────────────────────────────────
+function Get-RepoLandingDigest([string]$root) {
+    $lines = @()
+    try {
+        $repos = @()
+        if ([IO.Directory]::Exists((Join-Path $root '.git'))) { $repos += , @('(root)', $root) }
+        foreach ($d1 in [IO.Directory]::EnumerateDirectories($root)) {
+            $n1 = [IO.Path]::GetFileName($d1)
+            if ($n1.StartsWith('.')) { continue }
+            if ([IO.Directory]::Exists((Join-Path $d1 '.git'))) { $repos += , @($n1, $d1); continue }
+            # 容器目錄（如 scraper-system/ 外層）：真 repo 在下一層
+            foreach ($d2 in [IO.Directory]::EnumerateDirectories($d1)) {
+                if ([IO.Directory]::Exists((Join-Path $d2 '.git'))) {
+                    $repos += , @("$n1\$([IO.Path]::GetFileName($d2))", $d2)
+                }
+            }
+        }
+        $offDefault = @(); $desync = @(); $noRemote = @()
+        foreach ($r in $repos) {
+            $label = $r[0]; $g = Join-Path $r[1] '.git'
+            $head = ''
+            try { $head = [IO.File]::ReadAllText((Join-Path $g 'HEAD')).Trim() } catch { continue }
+            if ($head -notmatch '^ref: refs/heads/(.+)$') { continue }  # detached：不猜，略過
+            $br = $Matches[1]
+            $local = ''; $remote = ''
+            $lp = Join-Path $g "refs\heads\$br"; $rp = Join-Path $g "refs\remotes\origin\$br"
+            if ([IO.File]::Exists($lp)) { $local = [IO.File]::ReadAllText($lp).Trim() }
+            if ([IO.File]::Exists($rp)) { $remote = [IO.File]::ReadAllText($rp).Trim() }
+            if (-not $local -or -not $remote) {
+                $pk = Join-Path $g 'packed-refs'
+                if ([IO.File]::Exists($pk)) {
+                    foreach ($ln in [IO.File]::ReadLines($pk)) {
+                        if (-not $local -and $ln.EndsWith(" refs/heads/$br")) { $local = $ln.Split(' ')[0] }
+                        if (-not $remote -and $ln.EndsWith(" refs/remotes/origin/$br")) { $remote = $ln.Split(' ')[0] }
+                    }
+                }
+            }
+            if ($br -ne 'main' -and $br -ne 'master') { $offDefault += "$label→$br" }
+            if (-not $remote) { $noRemote += "$label($br)" }
+            elseif ($local -and $local -ne $remote) { $desync += "$label($br)" }
+        }
+        if ($desync) { $lines += "  [!] 與遠端不同步（有未推或已分岔）：$($desync -join '、')" }
+        if ($offDefault) { $lines += "  [!] 不在預設分支：$($offDefault -join '、')" }
+        if ($noRemote) { $lines += "  [!] 無 origin 對應分支（推不出去／只存在本機）：$($noRemote -join '、')" }
+    } catch { return @() }
+    return $lines
+}
+
+# ──────────────────────────────────────────────────────────────
 # 情境 3：在多子專案工作區根（code/）—— 定位不到單一子專案 toolchain
 # 設計：不硬擋，只提醒 + exit 0
 # ──────────────────────────────────────────────────────────────
 Write-Host 'verify: 目前 session 在多子專案工作區根，無法自動定位單一子專案進行完整驗證。'
 Write-Host '        若有實質修改，請在對應子專案內確認測試/型別/lint 全綠後再宣告完成。'
+$digest = @(Get-RepoLandingDigest $projectDir)
+if ($digest.Count -gt 0) {
+    Write-Host 'verify: 跨 repo git 落點（事實摘要，非阻擋；全部正常時不顯示）：'
+    $digest | ForEach-Object { Write-Host $_ }
+}
 exit 0

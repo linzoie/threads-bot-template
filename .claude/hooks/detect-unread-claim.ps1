@@ -59,6 +59,34 @@ $readSet = @(Get-Content $stateFile -ErrorAction SilentlyContinue |
     ForEach-Object { $_.Trim().ToLowerInvariant() })
 if ($readSet.Count -eq 0) { exit 0 }
 
+# 2b) 【中途啟用防呆】——本檔上線第一天就被自己抓到的誤報形狀（2026-08-01）
+#
+# 症狀：hook 在 session 進行到一半才被接線 → 已讀集合從那一刻才開始累積，
+# **接線前讀過的檔全部不在集合裡** → 對它們一律誤報。實例：接線當下那個 session
+# 的集合只有 1 筆（接線後唯一一次 Read），於是同一輪提到的三個「早就讀過」的檔
+# 全被指控未讀。這對「接線時正在跑的所有 session」都會發生，不是一次性事件。
+#
+# 判準：session 的起點以 transcript 檔的建立時間為準（transcript_path 是官方
+# common input field）。state 檔若明顯晚於 session 起點誕生 → 集合必然不完整 →
+# 本 session 一律放行。
+#
+# ⚠️ 【曾經寫錯的後備，別再加回來】初版在「拿不到 transcript_path」時退回
+# 「已讀集合 < 3 筆就放行」。測試立刻打紅 4 條：`sess-A`／`sess-B` 這類集合本來
+# 就只有 1-2 筆的正常案例全被放行＝**後備把主偵測整個關掉**。短 session 本來就
+# 讀不了幾個檔，用集合大小當暖機指標會製造大量假陰性。
+# → 現在只用 transcript 時間比對；拿不到 transcript_path 就**照常偵測**。
+# 殘餘風險：若該欄位在實際 payload 缺席，中途啟用的誤報會回來——但代價只是
+# 一輪解釋（且 stop_hook_active 讓下一輪不再擋），比靜默關掉偵測小得多。
+$graceMin = if ($env:GUARD_READS_ACTIVATION_GRACE_MIN) { [double]$env:GUARD_READS_ACTIVATION_GRACE_MIN } else { 2 }
+try {
+    $tp = "$($data.transcript_path)"
+    if ($tp -and (Test-Path -LiteralPath $tp)) {
+        $sessionStart = (Get-Item -LiteralPath $tp).CreationTime
+        $stateStart = (Get-Item -LiteralPath $stateFile).CreationTime
+        if (($stateStart - $sessionStart).TotalMinutes -gt $graceMin) { exit 0 }
+    }
+} catch { }   # 比對失敗不放行也不擋，落回正常偵測流程
+
 # 3) 條件①：徵求核可語氣。沒有在問使用者「要不要做」就不是提案，不管。
 $approvalPatterns = @(
     '要我', '要不要', '可以嗎', '好嗎', '如何[?？]', '建議', '我的建議',
