@@ -1,7 +1,8 @@
 # AGENTS.md — threads-bot-template
 
-> 共用治理規則見工作區層 `../AGENTS.md`（Codex／Antigravity 會沿目錄向上自動載入；
-> Claude Code 由 `CLAUDE.md` 匯入）。本檔只放**本專案專屬**內容。
+> 共用治理規則見工作區層 `../AGENTS.md`（Claude Code 由 `CLAUDE.md` 匯入；Codex 靠 `code/.codex-root`＋全域
+> `project_root_markers` 才會走到工作區層〔2026-09-14 修，之前從未載入〕；Antigravity IDE 只讀到最近的
+> repo 根、`agy -p` 不載入任何規則）。本檔只放**本專案專屬**內容。
 
 ## 這個專案是什麼
 
