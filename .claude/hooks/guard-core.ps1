@@ -42,9 +42,10 @@ function Get-DeleteClassification {
         $prev = $t
         $t = $t.Trim().Trim('(', ')').Trim()
         $t = $t -replace '^\w+=("[^"]*"|''[^'']*''|\S*)\s+', ''                                  # FOO=bar
-        $t = $t -replace '^(sudo|nohup|time|command|exec|env|stdbuf\s+\S+|nice(\s+-n\s+-?\d+)?)\s+', ''  # 裸 wrapper
+        $t = $t -replace '^(sudo|nohup|time|command|exec|env|busybox|toybox|stdbuf\s+\S+|nice(\s+-n\s+-?\d+)?)\s+', ''  # 裸 wrapper（busybox/toybox applet 前綴：2026-09-14 golden 抽測抓到）
         $t = $t -replace '^timeout(\s+(-{1,2}\S+|\d+[smhd]?))*\s+', ''                            # timeout [flags/時長…] cmd
         $t = $t -replace '^\\(?=\w)', ''                                                          # \rm -> rm
+        $t = $t -replace '^(?:/usr/local|/usr)?/s?bin/(?=\w)', ''                                 # /bin/rm、/usr/bin/rm、/sbin/… -> rm（2026-09-14 golden 抽測抓到：絕對路徑動詞直接放行）
         if ($t -imatch '^eval\s+') {                                                              # eval "rm …" -> rm …
             $t = ($t -replace '^eval\s+', '').Trim()
             if ($t -match '^"(.*)"$') { $t = $Matches[1] }
