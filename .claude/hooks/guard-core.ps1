@@ -45,7 +45,8 @@ function Get-DeleteClassification {
         $t = $t -replace '^(sudo|nohup|time|command|exec|env|busybox|toybox|stdbuf\s+\S+|nice(\s+-n\s+-?\d+)?)\s+', ''  # 裸 wrapper（busybox/toybox applet 前綴：2026-09-14 golden 抽測抓到）
         $t = $t -replace '^timeout(\s+(-{1,2}\S+|\d+[smhd]?))*\s+', ''                            # timeout [flags/時長…] cmd
         $t = $t -replace '^\\(?=\w)', ''                                                          # \rm -> rm
-        $t = $t -replace '^(?:/usr/local|/usr)?/s?bin/(?=\w)', ''                                 # /bin/rm、/usr/bin/rm、/sbin/… -> rm（2026-09-14 golden 抽測抓到：絕對路徑動詞直接放行）
+        $t = $t -replace '^(["''])([^"'']*?[\\/]s?bin[\\/]\w+(\.exe)?)\1(?=\s|$)', '$2'             # "C:/…/usr/bin/rm.exe" -rf → 先脫外層引號（2026-09-14 Windows 路徑變體，路徑含空白必帶引號）
+        $t = $t -replace '^(?:[A-Za-z]:)?(?:[\\/][^\\/]*?)*?[\\/]s?bin[\\/](?=\w)', ''                # /bin/rm、/usr/bin/rm、/sbin/…、/c/Program Files/Git/usr/bin/rm、C:\…\usr\bin\rm.exe -> rm（2026-09-14 golden 抽測抓到：絕對路徑動詞直接放行）
         if ($t -imatch '^eval\s+') {                                                              # eval "rm …" -> rm …
             $t = ($t -replace '^eval\s+', '').Trim()
             if ($t -match '^"(.*)"$') { $t = $Matches[1] }
