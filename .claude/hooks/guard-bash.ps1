@@ -132,6 +132,18 @@ if (-not (Get-Command Get-GuardVerdict -ErrorAction SilentlyContinue)) {
 $verdict = Get-GuardVerdict -Command $cmd
 # (d) 判定結果本身也要驗——core 內部若拋錯被吞，可能回 $null 或缺 decision 欄位
 if ($null -eq $verdict -or -not $verdict.decision) { FailVisible 'guard-core 回傳無效判定（null 或缺 decision 欄位）' }
+# 4b) 並行分支漂移（P0-2，2026-09-19）
+#     只在 core 判定為 pass 時才查：deny/ask 本來就會停下來，不需要疊第二層，
+#     也省掉不必要的 git 呼叫（Test-IsTreeMutatingGit 是純字串比對，微秒級；
+#     真正有成本的 git rev-parse 只在它命中時才跑）。
+#     **全程 fail-open**：Get-BranchDriftVerdict 內部任何一步取不到都回 pass。
+if ($verdict.decision -eq 'pass' -and
+    (Get-Command Test-IsTreeMutatingGit -ErrorAction SilentlyContinue) -and
+    (Test-IsTreeMutatingGit -Command $cmd)) {
+    $drift = Get-BranchDriftVerdict -Command $cmd
+    if ($null -ne $drift -and $drift.decision -eq 'ask') { Ask $drift.why }
+}
+
 switch ($verdict.decision) {
     'deny'  { Deny $verdict.why }
     'ask'   { Ask  $verdict.why }

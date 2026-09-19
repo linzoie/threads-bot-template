@@ -330,6 +330,236 @@ function Expand-ShellWrapper {
 }
 
 # ──────────────────────────────────────────────────────────────
+# 並行分支漂移偵測（P0-2，2026-09-19）
+#
+# 【為什麼】2026-09-18 與 09-19 兩次實際發生：一個 Claude session 工作到一半，
+# 另一個 session 把同一棵工作樹的 checkout 切到別的分支並留下未提交檔，
+# 而**沒有任何機制通知前者**——它是在做終態查詢時才發現的。
+# AGENTS.md 早有「序列交接」鐵則，缺的是**機制**不是規則；而違規者正是
+# hooks 唯一完整的那一家（Claude Code），證明既有 hooks 射程不含此接縫。
+# 依據：research-decisions/2026-09-18-cross-agent-handoff-fable-ruling-and-plan.md §A.6。
+#
+# 【為什麼是 ask 不是 deny】誤判成本不對稱：漏提醒＝可能互毀 git 狀態（可回復，
+# 有 reflog）；誤擋＝打斷工作流並訓練人忽略守門（信任損耗不可回復）。
+# 本層**永遠不回 deny**，由 test-branch-drift.ps1 §9 機械釘住。
+#
+# 【為什麼 fail-open】狀態檔缺失或損壞時放行並說明——這是**安全網不是閘門**
+# （memory components-not-alternatives）。做成閘門會在狀態檔還沒建立的第一個
+# session 就擋死所有 git 操作，那比沒有守門更糟。
+#
+# 這兩個都是**純函式**：零 I/O、所有輸入顯式傳入。真實的檔案讀取與 git 查詢
+# 留在 shim，這樣判定層才測得動（memory fixture-tests-must-not-read-real-env）。
+# ──────────────────────────────────────────────────────────────
+
+function Test-IsTreeMutatingGit {
+    <#
+    .SYNOPSIS 這條指令會不會動到 git 工作樹？
+    .DESCRIPTION
+      認定方式：指令裡出現 git 可執行檔 token，且**在它之後**出現會動樹的動詞。
+      先把折行與多重空白正規化，讓「多行折行」「多重空白」兩種繞法失效。
+      刻意不解析 git 的全域旗標（-C <path>、--git-dir=、-c k=v）——因為旗標的
+      值可能是裸路徑（`git -C C:\ws\repo checkout`），逐一枚舉旗標文法必漏。
+      改成「動詞出現在 git 之後」這個較寬的條件：本層只產生 ask，寬一點的代價
+      是偶爾多問一次，窄一點的代價是漏掉真正的漂移。
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string]$Command)
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+
+    # 正規化：反引號折行、CRLF、多重空白 → 單一空白
+    $c = $Command -replace '`\s*\r?\n', ' '
+    $c = $c -replace '\r?\n', ' '
+    $c = $c -replace '\s+', ' '
+
+    $gitToken = '(^|[\s&|;(])git(\.exe)?(\s|$)'
+    $m = [regex]::Match($c, $gitToken, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $m.Success) { return $false }
+
+    $after = $c.Substring($m.Index + $m.Length)
+    $verbs = 'checkout|switch|reset|merge|rebase|stash|pull|commit|clean'
+    return [bool][regex]::IsMatch($after, "(^|\s)($verbs)(\s|$)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
+function Test-BranchDrift {
+    <#
+    .SYNOPSIS 分支有沒有被別的 session 換掉？
+    .PARAMETER Recorded       本 session 開場記下的分支（來自 session-state json）
+    .PARAMETER Current        現在實際的分支（來自 git branch --show-current）
+    .PARAMETER RecordedBy     寫下該筆記錄的 session id
+    .PARAMETER SelfSession    我是誰
+    .PARAMETER StateAvailable 狀態檔可讀且可解析嗎（false 一律 fail-open）
+    .OUTPUTS @{ decision = 'pass'|'ask'; why = '...' }  —— 永遠不回 deny
+    #>
+    param(
+        [AllowEmptyString()] [string]$Recorded = '',
+        [AllowEmptyString()] [string]$Current = '',
+        [AllowEmptyString()] [string]$RecordedBy = '',
+        [AllowEmptyString()] [string]$SelfSession = '',
+        [bool]$StateAvailable = $false
+    )
+
+    if (-not $StateAvailable) {
+        return @{
+            decision = 'pass'
+            why      = '無法判定分支漂移：狀態檔缺失或損壞 → fail-open 放行（安全網不是閘門）'
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Recorded) -or [string]::IsNullOrWhiteSpace($Current)) {
+        return @{
+            decision = 'pass'
+            why      = '無法判定分支漂移：開場記錄或目前分支為空 → fail-open 放行'
+        }
+    }
+    if ($Recorded -eq $Current) {
+        return @{ decision = 'pass'; why = "分支與開場記錄一致（$Current）" }
+    }
+
+    # 顯示上限，避免 1000 字元的分支名把 ask 訊息灌爆
+    $shown = if ($Current.Length -gt 60) { $Current.Substring(0, 60) + '…' } else { $Current }
+    $by = if ([string]::IsNullOrWhiteSpace($RecordedBy)) { '' } else { "（開場記錄者 $RecordedBy）" }
+    return @{
+        decision = 'ask'
+        why      = "分支已從 $Recorded 切到 $shown$by，而你這個 session 沒有切過——" +
+                   '很可能是另一個 session 在同一棵工作樹上動作。' +
+                   '繼續前請先確認對方是否收工（AGENTS.md「多 agent 並行的鐵則：序列交接」）。'
+    }
+}
+
+# ── 以上為純函式（可單測）；以下為有 I/O 的外層，shim 呼叫這一層 ──
+
+function Get-CwdStateKey {
+    <#
+    .SYNOPSIS 把工作目錄轉成穩定的檔名鍵（同一棵樹共用一個狀態檔）
+    .DESCRIPTION
+      刻意不用 Get-FileHash：pwsh 7 spawn 出來的 powershell 5.1 子行程會繼承
+      PSModulePath 而找不到該 cmdlet（memory 已記，watch-credentials.ps1 同坑）。
+      直接用 .NET 的 SHA256 類別。
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'unknown' }
+    $norm = $Path.TrimEnd([char]92, [char]47).ToLowerInvariant()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $h = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($norm))
+        return (($h | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16)
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-BranchDriftVerdict {
+    <#
+    .SYNOPSIS Test-BranchDrift 的 I/O 外層：讀狀態檔、查 git，再交給純函式判定
+    .DESCRIPTION
+      **全程 fail-open**：任何一步取不到就回 pass。這是安全網不是閘門。
+
+      【警告一次就重新基準化】偵測到漂移並回 ask 之後，會把狀態檔的 branch 更新成
+      現況。理由：本層的目的是「讓你知道」，不是「每次都擋」。若不重新基準化，
+      同一次漂移會在後續每一條 git 指令重複發問，使用者三次之後就會學會無視它
+      ——那比沒有守門更糟（信任損耗不可回復）。對方若再切一次，你會再被通知一次。
+    #>
+    param(
+        [AllowEmptyString()] [string]$Command = '',
+        [AllowEmptyString()] [string]$StateDir = ''
+    )
+    try {
+        $cwd = (Get-Location).Path
+        if ([string]::IsNullOrWhiteSpace($StateDir)) {
+            $StateDir = Join-Path $HOME (Join-Path '.claude' 'session-state')
+        }
+        $f = Join-Path $StateDir ((Get-CwdStateKey -Path $cwd) + '.json')
+        if (-not (Test-Path -LiteralPath $f)) {
+            return (Test-BranchDrift -StateAvailable $false)
+        }
+
+        $j = $null
+        try { $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json }
+        catch { return (Test-BranchDrift -StateAvailable $false) }
+        if ($null -eq $j -or [string]::IsNullOrWhiteSpace("$($j.branch)")) {
+            return (Test-BranchDrift -StateAvailable $false)
+        }
+
+        $cur = ''
+        try { $cur = "$(& git -C $cwd rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1)".Trim() }
+        catch { $cur = '' }
+        if ([string]::IsNullOrWhiteSpace($cur)) {
+            return (Test-BranchDrift -StateAvailable $false)
+        }
+
+        $v = Test-BranchDrift -Recorded "$($j.branch)" -Current $cur `
+            -RecordedBy "$($j.session_id)" -SelfSession "$env:CLAUDE_CODE_SESSION_ID" -StateAvailable $true
+
+        if ($v.decision -eq 'ask') {
+            # 重新基準化（見上方說明）。寫失敗不影響判定——這一步純粹是降噪。
+            #
+            # ⚠️ 踩過的坑（2026-09-19，E2E 抓到）：原本寫成 `$j.branch = $cur` 再
+            # `$j.rebaselined_at = ...`。ConvertFrom-Json 回的是 PSCustomObject，
+            # 對**不存在的屬性**用 `.` 指派會拋錯，而下面這個 catch 把它連同
+            # branch 的更新一起吞掉 → 重新基準化從未生效、同一次漂移每條指令都重問。
+            # 純函式測試抓不到（它不碰 I/O），是端到端重演才現形。
+            # 修法：不去改 PSCustomObject，直接用讀到的值重建一個 ordered hashtable。
+            try {
+                $out = [ordered]@{
+                    cwd            = "$($j.cwd)"
+                    branch         = $cur
+                    head           = "$($j.head)"
+                    session_id     = "$($j.session_id)"
+                    started        = "$($j.started)"
+                    rebaselined_at = (Get-Date).ToUniversalTime().ToString('o')
+                }
+                [IO.File]::WriteAllText($f, ($out | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+            }
+            catch { }
+        }
+        return $v
+    }
+    catch {
+        return @{ decision = 'pass'; why = "分支漂移偵測本身出錯 → fail-open 放行：$($_.Exception.Message)" }
+    }
+}
+
+function Write-SessionBranchState {
+    <#
+    .SYNOPSIS 由 SessionStart hook 呼叫：把本 session 開場看到的分支記下來
+    .DESCRIPTION
+      放在 $HOME 不放 repo——寫進 repo 會製造髒工作樹，而髒工作樹正是這套機制
+      要偵測的東西之一。全程 fail-open，寫不成就算了（下次 git 指令會走
+      StateAvailable=$false 的放行路徑）。
+    #>
+    param(
+        [AllowEmptyString()] [string]$Cwd = '',
+        [AllowEmptyString()] [string]$StateDir = ''
+    )
+    try {
+        if ([string]::IsNullOrWhiteSpace($Cwd)) { $Cwd = (Get-Location).Path }
+        if (-not (Test-Path -LiteralPath (Join-Path $Cwd '.git'))) { return $false }
+
+        $br = ''
+        try { $br = "$(& git -C $Cwd rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1)".Trim() } catch { }
+        if ([string]::IsNullOrWhiteSpace($br)) { return $false }
+        $head = ''
+        try { $head = "$(& git -C $Cwd rev-parse --short HEAD 2>$null | Select-Object -First 1)".Trim() } catch { }
+
+        if ([string]::IsNullOrWhiteSpace($StateDir)) {
+            $StateDir = Join-Path $HOME (Join-Path '.claude' 'session-state')
+        }
+        if (-not (Test-Path -LiteralPath $StateDir)) {
+            $null = New-Item -ItemType Directory -Path $StateDir -Force
+        }
+        $payload = [ordered]@{
+            cwd        = $Cwd
+            branch     = $br
+            head       = $head
+            session_id = "$env:CLAUDE_CODE_SESSION_ID"
+            started    = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        $f = Join-Path $StateDir ((Get-CwdStateKey -Path $Cwd) + '.json')
+        [IO.File]::WriteAllText($f, ($payload | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+        return $true
+    }
+    catch { return $false }
+}
+
+# ──────────────────────────────────────────────────────────────
 # Get-GuardVerdict — 對外唯一入口（介面不變）。純判定，不 exit、不輸出 JSON。
 #   = 單層判定 + 殼內層展開判定，取較嚴格者。
 # ──────────────────────────────────────────────────────────────
