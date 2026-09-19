@@ -2,8 +2,16 @@
 # ============================================================
 # guard-core.ps1 — 危險指令守門「純判定核心」
 #
-# 從 guard-bash.ps1 抽出的純判定邏輯，供各 agent adapter（Claude／
-# Antigravity／Codex）共用。**純函式、無副作用**：
+# 從 guard-bash.ps1 抽出的純判定邏輯。**實際共用者只有兩家**：
+#   - Claude Code（guard-bash.ps1 → 本檔）
+#   - Antigravity（.agents/antigravity-guard.ps1 shim → 本檔）
+# ⚠️ **Codex 不共用**（2026-09-20 更正）：Codex 的執行期守門是 NO-GO
+#   （`.governance/decisions/2026-07-26-phase4-codex-guard-nogo.md`），
+#   它只有 pre-commit 機密掃描與散文規則。舊註解寫「Antigravity／Codex）共用」
+#   是已被推翻的主張，且該句**回聲進了引證稽核的正控組**，讓子字串比對
+#   自我確認、把已知錯誤判成 PASS（見 `.governance/reports/2026-09-19-citation-audit.md` §4）。
+#   守門覆蓋的真相源是 `.governance/reports/coverage-matrix.md`（doctor 產生），不是本註解。
+# **純函式、無副作用**：
 #   - 不讀 stdin
 #   - 不設 exit code
 #   - 不輸出 hookSpecificOutput JSON
@@ -380,11 +388,44 @@ function Test-IsTreeMutatingGit {
     return [bool][regex]::IsMatch($after, "(^|\s)($verbs)(\s|$)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 }
 
+function Test-IsBranchSwitchGit {
+    <#
+    .SYNOPSIS 這條指令是不是「切分支」？（checkout / switch）
+    .DESCRIPTION
+      比 Test-IsTreeMutatingGit 窄：只認 checkout／switch，因為只有它們會改變
+      `rev-parse --abbrev-ref HEAD`。給 PostToolUse 用——**你自己切的分支不該讓你
+      在下一條 git 指令被問一次**（Fable delta §5 #1-i：舊版狀態檔只在 SessionStart 寫，
+      自己 `git checkout -b` 之後必觸發一次假 ask；E2E-4 用 checkout -b 模擬「別人切走」，
+      等於同時證明了這個假陽性）。
+      正規化與 Test-IsTreeMutatingGit 一致（折行／多重空白／git 之後才算動詞）。
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string]$Command)
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+    $c = $Command -replace '`\s*\r?\n', ' '
+    $c = $c -replace '\r?\n', ' '
+    $c = $c -replace '\s+', ' '
+
+    $m = [regex]::Match($c, '(^|[\s&|;(])git(\.exe)?(\s|$)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $m.Success) { return $false }
+    $after = $c.Substring($m.Index + $m.Length)
+    return [bool][regex]::IsMatch($after, '(^|\s)(checkout|switch)(\s|$)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
 function Test-BranchDrift {
     <#
-    .SYNOPSIS 分支有沒有被別的 session 換掉？
-    .PARAMETER Recorded       本 session 開場記下的分支（來自 session-state json）
-    .PARAMETER Current        現在實際的分支（來自 git branch --show-current）
+    .SYNOPSIS 分支有沒有在上次記錄之後被換掉？
+    .DESCRIPTION
+      ⚠️ **本層不知道是誰切的**（2026-09-20 更正）。狀態檔以 cwd 為鍵、所有 session 共用，
+      後開的 session 其 SessionStart 會覆寫基準。所以真實語意是
+      「**自上次有人記錄或基準化以來**，分支變了沒」，不是「自我開場以來」。
+      這個語意夠用（09-18／09-19 兩案都抓得到），但訊息不得多說——舊版寫
+      「而你這個 session 沒有切過」是工具**無從得知**的斷言，且自己 `git checkout -b`
+      之後必觸發一次假 ask。
+    .PARAMETER Recorded       上次記錄／基準化時的分支（來自 session-state json）
+    .PARAMETER Current        現在實際的分支（來自 git rev-parse --abbrev-ref HEAD）
+    .PARAMETER Pending        上一次已就「切到哪個分支」提示過使用者的目標分支。
+                              等於 Current ＝ 使用者看過提示後選擇繼續 → 這次放行並由 I/O 層基準化。
     .PARAMETER RecordedBy     寫下該筆記錄的 session id
     .PARAMETER SelfSession    我是誰
     .PARAMETER StateAvailable 狀態檔可讀且可解析嗎（false 一律 fail-open）
@@ -393,6 +434,7 @@ function Test-BranchDrift {
     param(
         [AllowEmptyString()] [string]$Recorded = '',
         [AllowEmptyString()] [string]$Current = '',
+        [AllowEmptyString()] [string]$Pending = '',
         [AllowEmptyString()] [string]$RecordedBy = '',
         [AllowEmptyString()] [string]$SelfSession = '',
         [bool]$StateAvailable = $false
@@ -411,17 +453,30 @@ function Test-BranchDrift {
         }
     }
     if ($Recorded -eq $Current) {
-        return @{ decision = 'pass'; why = "分支與開場記錄一致（$Current）" }
+        return @{ decision = 'pass'; why = "分支與上次記錄一致（$Current）" }
     }
 
     # 顯示上限，避免 1000 字元的分支名把 ask 訊息灌爆
     $shown = if ($Current.Length -gt 60) { $Current.Substring(0, 60) + '…' } else { $Current }
-    $by = if ([string]::IsNullOrWhiteSpace($RecordedBy)) { '' } else { "（開場記錄者 $RecordedBy）" }
+
+    # 【已提示過且使用者選擇繼續】上一次就這個目標分支問過了，這次放行。
+    # 舊版在「發問的當下」就基準化，使用者答「否」完全沒有後果（下一條指令照樣 pass）——
+    # 答否等於沒答。改成 pending：只有在使用者看過提示、且**仍在同一個分支上**再下一條
+    # 指令時才基準化。答否後切回原分支會再被問一次，那是正確的。
+    if (-not [string]::IsNullOrWhiteSpace($Pending) -and $Pending -eq $Current) {
+        return @{
+            decision = 'pass'
+            why      = "分支漂移（$Recorded → $shown）已於上一次提示，你選擇繼續 → 重新基準化，不重複發問"
+        }
+    }
+
+    $by = if ([string]::IsNullOrWhiteSpace($RecordedBy)) { '' } else { "（上次記錄者 $RecordedBy）" }
     return @{
         decision = 'ask'
-        why      = "分支已從 $Recorded 切到 $shown$by，而你這個 session 沒有切過——" +
-                   '很可能是另一個 session 在同一棵工作樹上動作。' +
-                   '繼續前請先確認對方是否收工（AGENTS.md「多 agent 並行的鐵則：序列交接」）。'
+        why      = "分支已從 $Recorded 變成 $shown$by——自上次記錄或基準化以來有人切過分支。" +
+                   '本層不知道是誰切的：可能是另一個 session 在同一棵工作樹上動作，也可能是你自己剛切。' +
+                   '⚠️ 你在原分支上改過但未提交的檔會跟著切到新分支。' +
+                   '若不是你切的，繼續前請先確認對方是否收工（AGENTS.md「多 agent 並行的鐵則：序列交接」）。'
     }
 }
 
@@ -452,8 +507,11 @@ function Get-BranchDriftVerdict {
     .DESCRIPTION
       **全程 fail-open**：任何一步取不到就回 pass。這是安全網不是閘門。
 
-      【警告一次就重新基準化】偵測到漂移並回 ask 之後，會把狀態檔的 branch 更新成
-      現況。理由：本層的目的是「讓你知道」，不是「每次都擋」。若不重新基準化，
+      【提示一次 → 使用者繼續才基準化】（2026-09-20 改，Fable delta 裁決 §5 #2）
+      偵測到漂移時**只記 pending_drift、不動 branch**；使用者看過提示、仍在同一個分支上
+      再下一條指令時，才把 branch 更新成現況。舊版在發問的當下就基準化，使用者答「否」
+      之後下一條指令照樣 pass——**答否等於沒答**。
+      理由：本層的目的是「讓你知道」，不是「每次都擋」。若不重新基準化，
       同一次漂移會在後續每一條 git 指令重複發問，使用者三次之後就會學會無視它
       ——那比沒有守門更糟（信任損耗不可回復）。對方若再切一次，你會再被通知一次。
     #>
@@ -485,10 +543,25 @@ function Get-BranchDriftVerdict {
             return (Test-BranchDrift -StateAvailable $false)
         }
 
-        $v = Test-BranchDrift -Recorded "$($j.branch)" -Current $cur `
+        $pendingPrev = "$($j.pending_drift)"
+        $v = Test-BranchDrift -Recorded "$($j.branch)" -Current $cur -Pending $pendingPrev `
             -RecordedBy "$($j.session_id)" -SelfSession "$env:CLAUDE_CODE_SESSION_ID" -StateAvailable $true
 
+        # 狀態檔的兩種更新（都不影響判定；寫失敗只是降噪失效）：
+        #  (1) ask → 只記 pending_drift，**不動 branch**。基準線要留著，
+        #      否則使用者答「否」之後下一條指令照樣 pass ＝ 答否沒有任何後果。
+        #  (2) 已提示過且使用者仍在同分支下指令（＝看過、選擇繼續）→ 這時才真正基準化。
+        $needWrite = $false
+        $newBranch = "$($j.branch)"
+        $newPending = $pendingPrev
         if ($v.decision -eq 'ask') {
+            $needWrite = $true; $newPending = $cur
+        }
+        elseif ($pendingPrev -and $pendingPrev -eq $cur) {
+            $needWrite = $true; $newBranch = $cur; $newPending = ''
+        }
+
+        if ($needWrite) {
             # 重新基準化（見上方說明）。寫失敗不影響判定——這一步純粹是降噪。
             #
             # ⚠️ 踩過的坑（2026-09-19，E2E 抓到）：原本寫成 `$j.branch = $cur` 再
@@ -500,10 +573,11 @@ function Get-BranchDriftVerdict {
             try {
                 $out = [ordered]@{
                     cwd            = "$($j.cwd)"
-                    branch         = $cur
+                    branch         = $newBranch
                     head           = "$($j.head)"
                     session_id     = "$($j.session_id)"
                     started        = "$($j.started)"
+                    pending_drift  = $newPending
                     rebaselined_at = (Get-Date).ToUniversalTime().ToString('o')
                 }
                 [IO.File]::WriteAllText($f, ($out | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
@@ -520,6 +594,10 @@ function Get-BranchDriftVerdict {
 function Write-SessionBranchState {
     <#
     .SYNOPSIS 由 SessionStart hook 呼叫：把本 session 開場看到的分支記下來
+    .OUTPUTS 成功回**分支名**（非空字串）、失敗回空字串。
+      ⚠️ 2026-09-20 從 $true/$false 改成 branch/''：呼叫端要把它印出來
+      （Fable delta §5 #3——原本 pass 路徑完全靜音，hook 若沒生效沒有任何訊號，
+      保護會靜默消失）。`[bool]` 語意不變（非空字串為真、'' 為假），既有斷言照舊成立。
     .DESCRIPTION
       放在 $HOME 不放 repo——寫進 repo 會製造髒工作樹，而髒工作樹正是這套機制
       要偵測的東西之一。全程 fail-open，寫不成就算了（下次 git 指令會走
@@ -531,11 +609,11 @@ function Write-SessionBranchState {
     )
     try {
         if ([string]::IsNullOrWhiteSpace($Cwd)) { $Cwd = (Get-Location).Path }
-        if (-not (Test-Path -LiteralPath (Join-Path $Cwd '.git'))) { return $false }
+        if (-not (Test-Path -LiteralPath (Join-Path $Cwd '.git'))) { return '' }
 
         $br = ''
         try { $br = "$(& git -C $Cwd rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1)".Trim() } catch { }
-        if ([string]::IsNullOrWhiteSpace($br)) { return $false }
+        if ([string]::IsNullOrWhiteSpace($br)) { return '' }
         $head = ''
         try { $head = "$(& git -C $Cwd rev-parse --short HEAD 2>$null | Select-Object -First 1)".Trim() } catch { }
 
@@ -554,9 +632,9 @@ function Write-SessionBranchState {
         }
         $f = Join-Path $StateDir ((Get-CwdStateKey -Path $Cwd) + '.json')
         [IO.File]::WriteAllText($f, ($payload | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
-        return $true
+        return $br
     }
-    catch { return $false }
+    catch { return '' }
 }
 
 # ──────────────────────────────────────────────────────────────

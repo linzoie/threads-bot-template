@@ -11,6 +11,14 @@
 #     suggest_time）→ 放行（exit 0）。
 #   - 其餘 MCP 動作（create/send/update/delete/upload/label… 寫入或對外）→ ASK。
 #   - **未知 MCP 動作**（不在唯讀白名單）→ 一律 ASK（使用者選 fail-closed）。
+#
+# ⚠️ **白名單實際生效 16 格，不是 17**（2026-08-01 行為驗證，2026-09-20 裁決 8-C 註記）：
+#   把白名單 17 個 host 逐一種進 state 後呼叫真實部署的 hook，只有 `docs.github.com`
+#   仍回 ASK——它在白名單上，卻被安全網對 `github.com` 的**後綴比對先攔下**。
+#   對照組（未種 state 的 `code.claude.com`）回 ASK，證明探針有鑑別力。
+#   **零安全影響**（它現在的行為是「永遠問」，修掉後還是「永遠問」），
+#   但**會汙染量測基準**——任何「白名單能省多少確認」的計算都會以為有 17 格。
+#   修檔本身併進下次動 hook 的那一輪（裁決 8-B），本次只補這段註記讓基準不再騙人。
 #   - WebFetch（對外抓取，可能 SSRF/資料外送）→ 每 session 每 host 問一次
 #     （2026-07-29 dedup，見下方 WebFetch 專用段落與威脅模型）。
 #

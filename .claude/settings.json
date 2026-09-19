@@ -81,6 +81,15 @@
         ]
       },
       {
+        "matcher": "^(Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/record-branch-switch.ps1\""
+          }
+        ]
+      },
+      {
         "matcher": "^(Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit)$",
         "hooks": [
           {
