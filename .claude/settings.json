@@ -50,6 +50,15 @@
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-read-secrets.ps1\""
           }
         ]
+      },
+      {
+        "matcher": "^Workflow$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-workflow-prior-art.ps1\""
+          }
+        ]
       }
     ],
     "PostToolUse": [
