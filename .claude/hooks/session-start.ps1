@@ -42,6 +42,29 @@ try {
 }
 catch { }
 
+# ── P1-6 規則載入金絲雀：留下「這個 session 有讀到規則」的證據 ─────────
+# 【為什麼】2026-07-24→09-14 有七週，Codex 與 Antigravity 從未載入 code/AGENTS.md
+# （它們的 repo 根是最近的 .git，子專案裡讀不到工作區層），**沒有任何人知道**。
+# 修法 09-14 落地，但接線是一次性驗證——工具會自動更新、config 會被覆蓋、
+# 新建的 repo 一定沒有 .codex-root。這個 marker 就是那個持續驗證。
+#
+# ⚠️ **這幾行的寫法是實測出來的，別「整理」它**（2026-09-20，五種形式逐一實測）：
+# lib-shipset.ps1 的 Get-DotSourceTargets 只要看到「引號字串裡含路徑分隔符 ＋ .ps1」
+# 就會把該檔拉進全域 ship-set，**連用 & 呼叫都會中招**；而改成單一變數的 dot-source
+# 又會被 Get-UnparsedDotSources 判成「抽不出目標」。兩者都是 fail-closed：
+# sync 的閉包斷言會擋下整批散佈（零檔案落地），doctor 全域段會多兩個 ERROR。
+# 唯一兩邊都乾淨的形式＝**分兩段 Join-Path 組路徑 ＋ 用 & 呼叫**（下面這四行）。
+$markScript = ''
+try {
+    if ($govRoot) {
+        $govBin = Join-Path $govRoot '.governance'
+        $govBin = Join-Path $govBin 'bin'
+        $markScript = Join-Path $govBin 'mark-loaded.ps1'
+        if (Test-Path $markScript) { & $markScript -Tool claude | Out-Null } else { $markScript = '' }
+    }
+}
+catch { $markScript = '' }
+
 Write-Output '=== 治理提醒（SessionStart 自動注入）==='
 # 分支基準的**活體正控**（2026-09-20，Fable delta §5 #3）：並行漂移偵測的 pass 路徑
 # 完全靜音——hook 若沒生效、或狀態檔寫不出來，保護會**靜默消失且沒有任何訊號**。
