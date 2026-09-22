@@ -80,10 +80,21 @@ $sid = $data.session_id
 if ([string]::IsNullOrWhiteSpace($sid)) { exit 0 }
 $sidSan = ($sid -replace '[^A-Za-z0-9_.-]', '_')
 
+# 2026-09-22：StartsWith(TEMP) 不解析 reparse point——%TEMP% 內一個 junction 就能把 state 導到 TEMP 外。
+# 逐層檢查既存祖先，任一是 reparse point（junction／symlink）即拒（讀不到＝fail-closed）。
+function Test-NoReparseUnderTemp([string]$full, [string]$tmpRoot) {
+    $stop = $tmpRoot.TrimEnd('\', '/'); $p = $full
+    while ($p -and $p.StartsWith($stop, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath $p) { try { if ((Get-Item -LiteralPath $p -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false } } catch { return $false } }
+        $parent = [IO.Path]::GetDirectoryName($p); if (-not $parent -or $parent -eq $p) { break }; $p = $parent
+    }
+    return $true
+}
+
 try {
-    # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，與 guard-mcp 同步加固）
+    # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，與 guard-mcp 同步加固）；2026-09-22 補 junction 解析
     $stateDir = Join-Path ([IO.Path]::GetTempPath()) 'claude-guard-webfetch'
-    if ($env:GUARD_WEBFETCH_STATE_DIR) { try { $c = [IO.Path]::GetFullPath($env:GUARD_WEBFETCH_STATE_DIR); if ($c.StartsWith([IO.Path]::GetFullPath(([IO.Path]::GetTempPath())), [System.StringComparison]::OrdinalIgnoreCase)) { $stateDir = $c } } catch { } }
+    if ($env:GUARD_WEBFETCH_STATE_DIR) { try { $c = [IO.Path]::GetFullPath($env:GUARD_WEBFETCH_STATE_DIR); $tr = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath())); if ($c.StartsWith($tr, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-NoReparseUnderTemp $c $tr)) { $stateDir = $c } } catch { } }
     if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
     $stateFile = Join-Path $stateDir "$sidSan.txt"
 

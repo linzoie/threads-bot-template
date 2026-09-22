@@ -146,13 +146,25 @@ $patterns = @(
 # outcome 觀測：記 ask 到 governance-logs。fail-open。
 # env 重導向限 TEMP——settings 的 env 是 hook 的隱性不可信輸入（2026-07-31 已一手實證：
 # 隔離 fixture 的 settings.env 金絲雀確實注入到 hook 子行程，且能改寫 log 落點）。
+# 2026-09-22：StartsWith(TEMP) 不解析 reparse point——%TEMP% 內一個 junction 就能把 log 導到 TEMP 外。
+# 逐層檢查既存祖先，任一是 reparse point（junction／symlink）即拒（讀不到＝fail-closed）。
+function Test-NoReparseUnderTemp([string]$full, [string]$tmpRoot) {
+    $stop = $tmpRoot.TrimEnd('\', '/'); $p = $full
+    while ($p -and $p.StartsWith($stop, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath $p) { try { if ((Get-Item -LiteralPath $p -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false } } catch { return $false } }
+        $parent = [IO.Path]::GetDirectoryName($p); if (-not $parent -or $parent -eq $p) { break }; $p = $parent
+    }
+    return $true
+}
+
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     try {
         $dir = Join-Path $HOME '.claude\governance-logs'
         if ($env:GOVLOG_DIR) {
             try {
                 $c = [IO.Path]::GetFullPath($env:GOVLOG_DIR)
-                if ($c.StartsWith([IO.Path]::GetFullPath(([IO.Path]::GetTempPath())), [System.StringComparison]::OrdinalIgnoreCase)) { $dir = $c }
+                $tr = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()))
+                if ($c.StartsWith($tr, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-NoReparseUnderTemp $c $tr)) { $dir = $c }
             } catch { }
         }
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }

@@ -59,6 +59,15 @@
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-workflow-prior-art.ps1\""
           }
         ]
+      },
+      {
+        "matcher": "^(Agent|Workflow)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-dispatch-taint.ps1\""
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -95,6 +104,25 @@
           {
             "type": "command",
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/record-reads.ps1\""
+          }
+        ]
+      },
+      {
+        "matcher": "^(Agent|Workflow|TaskOutput)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/record-security-warning.ps1\""
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/record-security-warning.ps1\""
           }
         ]
       }

@@ -29,12 +29,23 @@ if (-not $cmd) { exit 0 }
 # 快篩：不含 git add / git commit 就直接放行
 if ($cmd -inotmatch 'git\b[^;&|]*\b(add|commit)\b') { exit 0 }
 
+# 2026-09-22：StartsWith(TEMP) 不解析 reparse point——%TEMP% 內一個 junction 就能把 log 導到 TEMP 外。
+# 逐層檢查既存祖先，任一是 reparse point（junction／symlink）即拒（讀不到＝fail-closed）。
+function Test-NoReparseUnderTemp([string]$full, [string]$tmpRoot) {
+    $stop = $tmpRoot.TrimEnd('\', '/'); $p = $full
+    while ($p -and $p.StartsWith($stop, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath $p) { try { if ((Get-Item -LiteralPath $p -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false } } catch { return $false } }
+        $parent = [IO.Path]::GetDirectoryName($p); if (-not $parent -or $parent -eq $p) { break }; $p = $parent
+    }
+    return $true
+}
+
 # outcome 觀測（2026-07-11）：記 deny 到 governance-logs（不記檔名/內容，避免洩密）。fail-open。
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     try {
-        # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，防守門 log 被導走）
+        # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，防守門 log 被導走）；2026-09-22 補 junction 解析
         $dir = Join-Path $HOME '.claude\governance-logs'
-        if ($env:GOVLOG_DIR) { try { $c = [IO.Path]::GetFullPath($env:GOVLOG_DIR); if ($c.StartsWith([IO.Path]::GetFullPath(([IO.Path]::GetTempPath())), [System.StringComparison]::OrdinalIgnoreCase)) { $dir = $c } } catch { } }
+        if ($env:GOVLOG_DIR) { try { $c = [IO.Path]::GetFullPath($env:GOVLOG_DIR); $tr = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath())); if ($c.StartsWith($tr, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-NoReparseUnderTemp $c $tr)) { $dir = $c } } catch { } }
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $f = Join-Path $dir ('decisions-' + (Get-Date -Format 'yyyy-MM') + '.jsonl')
         $line = @{ ts = (Get-Date -Format 'o'); hook = $hook; decision = $decision; why = $why } | ConvertTo-Json -Compress

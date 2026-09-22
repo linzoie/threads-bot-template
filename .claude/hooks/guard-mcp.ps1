@@ -90,12 +90,23 @@ if (-not $tool) { exit 0 }
 # run-all／test-mcp-guard／probe-guards 全都指向 TEMP）。settings 的 env 區塊是 hook 的
 # 隱性不可信輸入——TEMP 白名單讓「把守門 log 導去別處藏」「預埋 state 目錄」失效；
 # TEMP 內的殘餘操縱空間與檔頭威脅模型已列的既知繞法等價，不新增攻擊面。
+# 2026-09-22：StartsWith(TEMP) 不解析 reparse point——%TEMP% 內一個 junction 就能把目錄導到 TEMP 外。
+# 逐層檢查既存祖先，任一是 reparse point（junction／symlink）即拒（讀不到＝fail-closed）。
+function Test-NoReparseUnderTemp([string]$full, [string]$tmpRoot) {
+    $stop = $tmpRoot.TrimEnd('\', '/'); $p = $full
+    while ($p -and $p.StartsWith($stop, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath $p) { try { if ((Get-Item -LiteralPath $p -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false } } catch { return $false } }
+        $parent = [IO.Path]::GetDirectoryName($p); if (-not $parent -or $parent -eq $p) { break }; $p = $parent
+    }
+    return $true
+}
+
 function Resolve-TempScopedDir([string]$candidate, [string]$fallback) {
     if ([string]::IsNullOrWhiteSpace($candidate)) { return $fallback }
     try {
         $full = [IO.Path]::GetFullPath($candidate)
         $tmpRoot = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()))
-        if ($full.StartsWith($tmpRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $full }
+        if ($full.StartsWith($tmpRoot, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-NoReparseUnderTemp $full $tmpRoot)) { return $full }
     } catch { }
     return $fallback
 }

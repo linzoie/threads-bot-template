@@ -298,7 +298,16 @@ function Get-GuardVerdictSingle {
         @{ rx = '\b(powershell|pwsh)(\.exe)?\b[^;&|]*\s-(e|ec|enc|encoded|encodedcommand)\b'; why = 'PowerShell -EncodedCommand（base64 指令，內容不可靜態判定）' },
         # 2026-07-31（settings.local 破口同批）：--settings 指定外部設定檔＝第四種設定載體，
         # 可載入未受 guard-write 保護、未進版控的 permissions/hooks/env。與 protectRx 三載體同壘。
-        @{ rx = '\bclaude(\.exe|\.cmd)?\b[^;&|]*\s--settings\b'; why = 'claude --settings 指定外部設定檔（繞過版控 settings 的第四種載體，先確認來源）' }
+        @{ rx = '\bclaude(\.exe|\.cmd)?\b[^;&|]*\s--settings\b'; why = 'claude --settings 指定外部設定檔（繞過版控 settings 的第四種載體，先確認來源）' },
+        # 2026-09-20（09-19 taskkill //IM 事故後的最小備援；完整評估見 research-decisions/2026-09-20-taskkill-incident-prevention.md）：
+        # 程序終止動詞**出現在指令任何位置**就 ask。主防線是 settings 的 permissions.deny（整條 taskkill／Stop-Process -Name／pkill／killall），
+        # 但實測 settings 規則有兩個洞：Bash 規則分大小寫（`Taskkill` 放行）、帶迴圈變數的 for 迴圈本體不被分析
+        # （`for p in $(tasklist…); do taskkill /F /PID $p; done` 放行＝事故第二條的原形）。本規則用 -imatch 對整串比對，
+        # 迴圈／變數／殼包裹／全路徑／大小寫都看得到。刻意用 ask 不用 deny：commit 訊息或 grep 提到這些字也會被問一次，
+        # 但那是低頻且可放行的；deny 會連治理工作本身一起鎖死（紅隊實測 14 條）。合法收尾路徑＝ .governance/bin/with-child.mjs。
+        # 不抓裸 `kill`（bash builtin 的 kill %1／PowerShell 別名太常見於無害脈絡）；PowerShell 別名 spps 抓。
+        @{ rx = '(^|[\s;&|(`"''/\\=])(taskkill|tskill|pkill|killall|stop-process|spps)(\.exe)?(?![\w.-])'; why = '程序終止指令（2026-09-19 事故）：只准用 with-child.mjs 收自己登記的 PID；按名稱／篩選／埠／迴圈／變數殺一律先問' },
+        @{ rx = '\bwmic(\.exe)?\b[^;&|]*\bprocess\b[^;&|]*\b(delete|call\s+terminate)\b|\b(invoke-cimmethod|invoke-wmimethod)\b[^;&|]*\bterminate\b|\.(kill|terminate|closemainwindow)\s*\('; why = '程序終止（WMI／CIM Terminate、.Kill()／.CloseMainWindow()）：只准用 with-child.mjs 收自己登記的 PID' }
     )
     foreach ($p in $askPatterns) {
         if ($cmd -imatch $p.rx) { return @{ decision = 'ask'; why = $p.why } }
