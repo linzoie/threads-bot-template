@@ -41,6 +41,17 @@ commit message 格式維持英文慣例；引用官方文件與套件名稱保�
 
 ## 接手工作：開工前的固定第一步
 
+**第 0 步（每個 session 開場做一次，Claude Code 由 hook 自動做、其餘三家請自己跑）**：
+
+```text
+pwsh <工作區>/.governance/bin/mark-loaded.ps1 -Tool <claude|codex|gemini|antigravity>
+```
+
+這是**規則載入金絲雀**：它留下的 marker 是「我這次真的讀到規則了」的唯一證據。
+2026-07-24→09-14 有七週，Codex 與 Antigravity 從未載入本檔（它們的 repo 根是最近的
+`.git`，子專案裡讀不到工作區層），而**沒有任何人知道**。你沒讀到這段就不會跑它，
+所以 marker 的缺席正好等於「規則沒載入」——`governance-doctor.ps1` 會據此發出 WARN。
+
 每個專案的「工作到哪了」權威來源是交接狀態卡：`.governance/handoff/projects/<專案>.md`
 
 1. 讀該卡，用一句話總結你理解的現況與待辦
@@ -128,6 +139,11 @@ workflow）時，證據必須是**用那個確切呼叫方式端到端跑過一�
 - **對外發送**：email、Slack、Telegram、建立／關閉／留言 PR 或 issue、推送遠端、上傳第三方
 - **跳過安全機制**：`--no-verify`、`--no-gpg-sign`、停用 hook、降級或移除套件
 - **共享狀態**：改 CI/CD、改權限、改共用基礎設施、改影響大的全域設定
+- **機器狀態**（2026-09-19 事故後加入）：**不得終止任何不是你在本 session 自己啟動並記下 PID 的程序；
+  不得改排程、服務、永久環境變數、登錄檔、關機重啟。**（含但不限於按映像名、按篩選、按埠號、
+  `tasklist`／`Get-Process` 後迴圈或管線終止、`.Kill()`／`Terminate()`／`CloseMainWindow()`；
+  **沒列到的形式不代表允許**。「看起來像自己的」不算自己的。）收尾只走
+  `node .governance/bin/with-child.mjs run|stop`；測試用瀏覽器一律帶專屬 `--user-data-dir`。
 
 **一次授權不等於永久授權**：換情境要重新確認。
 
