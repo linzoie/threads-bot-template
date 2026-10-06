@@ -111,6 +111,27 @@ function Resolve-TempScopedDir([string]$candidate, [string]$fallback) {
     return $fallback
 }
 
+# 2026-10-02（修補簡報 R-M2）：WebFetch 預放行檔專用的目錄解析——與上面
+# Resolve-TempScopedDir 的差異只有兩點：①即使**沒有**覆寫（candidate 為空），
+# fallback 本身也要過 TEMP 範圍＋reparse 檢查（原版 candidate 為空直接回傳
+# fallback，完全跳過檢查——這正是攻擊腿「預設目錄不存在時建 junction 指向自控
+# 目錄」能得手的根因：fallback 從未被驗證過）；②覆寫被拒絕時回 $null，**不**
+# 退回 fallback（原版退回 fallback，會讓測試在隔離 fixture 裡不小心讀到真實
+# %TEMP%\claude-guard-webfetch——fixture 讀真環境；也讓「覆寫被拒」在正式環境
+# 下悄悄變成「改用預設目錄」，使用者設定被拒絕的訊號就這樣消失了）。
+# 其餘呼叫端（Write-GovLog、session dedup state）維持用原版 Resolve-TempScopedDir，
+# 刻意不動——那些呼叫點的「retry fallback」行為是既有驗證過的設計，不在本次
+# 修補範圍內。
+function Resolve-WebFetchPreapproveDir([string]$candidate, [string]$fallback) {
+    $target = if ([string]::IsNullOrWhiteSpace($candidate)) { $fallback } else { $candidate }
+    try {
+        $full = [IO.Path]::GetFullPath($target)
+        $tmpRoot = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()))
+        if ($full.StartsWith($tmpRoot, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-NoReparseUnderTemp $full $tmpRoot)) { return $full }
+    } catch { }
+    return $null
+}
+
 # outcome 觀測（2026-07-11）：記 ask 到 governance-logs（記 tool_name，屬非機密）。fail-open。
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     try {
@@ -143,12 +164,17 @@ function AskMcp([string]$why) {
 # raw.githubusercontent.com 是實測前三大 host 但屬第三方託管內容平台（安全網），
 # 不放進來；*.readthedocs.io／*.github.io／dev.to／www.tradingview.com／capafy.ai
 # 等即使流量高也明確排除（同上理由）。
+# 2026-10-02（webfetch-preapproval spec §2(A)）：加 learn.microsoft.com（LinkedIn
+# Marketing API 文件全在此）、legal.linkedin.com（API ToU 等條款）。**不加**
+# www.linkedin.com：它同時是使用者內容平台（貼文／個人檔案），違反「只放官方文件站」
+# 原則；其 /legal/*、/help/* 路徑走 (B) 預放行檔，不走永久白名單（白名單只能比對
+# host，做不到路徑）。
 $script:DedupAllowlistHosts = @(
     'code.claude.com', 'platform.claude.com', 'support.claude.com', 'docs.anthropic.com',
     'www.anthropic.com', 'arxiv.org', 'core.telegram.org', 'developer.mozilla.org',
     'nodejs.org', 'developer.tastytrade.com', 'support.tastytrade.com',
     'developers.line.biz', 'obsidian.md', 'help.obsidian.md', 'law.moj.gov.tw',
-    'developers.openai.com', 'docs.github.com'
+    'developers.openai.com', 'docs.github.com', 'learn.microsoft.com', 'legal.linkedin.com'
 )
 # 測試專用擴充（**只走 CLI 參數 -TestAllowlistExtra**；正式接線不帶參數＝無作用；
 # 精確比對，不做 suffix）。2026-07-31 起不再讀 GUARD_WEBFETCH_ALLOWLIST_EXTRA 環境
@@ -258,6 +284,106 @@ function Test-DedupEligible([System.Uri]$uri, [string]$rawUrl) {
     return $true
 }
 
+# 【B，2026-10-02 webfetch-preapproval spec §2(B)】WebFetch 預放行檔——使用者親手
+# 跑 .governance/bin/preapprove-webfetch.ps1 為一個有時效的視窗預放行一組 host；
+# hook 對清單內 host 不再問。檔案：%TEMP%\claude-guard-webfetch\preapproved-<cwdhash>.txt
+# （與既有 session dedup state 同一個目錄，重用 Resolve-TempScopedDir 的 TEMP
+# 範圍檢查＋reparse point 防護，不另開一條攻擊面）。
+#
+# <cwdhash>＝stdin JSON 的 cwd（正規化：GetFullPath、小寫、去尾斜線）之 SHA-1 前
+# 16 碼——**這個函式字串必須與 .governance/bin/preapprove-webfetch.ps1 的
+# Get-PreapproveCwdHash 逐字一致**，否則使用者跑輔助腳本寫的檔，hook 這端永遠
+# 算不出同一個檔名、B 功能形同沒接上（見該檔檔頭同一句警告）。
+function Get-WebFetchCwdHash([string]$cwdRaw) {
+    if ([string]::IsNullOrWhiteSpace($cwdRaw)) { return $null }
+    try {
+        $full = [IO.Path]::GetFullPath($cwdRaw)
+        $norm = $full.ToLowerInvariant().TrimEnd('\', '/')
+        $bytes = [Text.Encoding]::UTF8.GetBytes($norm)
+        $sha1 = [Security.Cryptography.SHA1]::Create()
+        $hashBytes = $sha1.ComputeHash($bytes)
+        $hex = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+        return $hex.Substring(0, 16)
+    } catch { return $null }
+}
+
+# 回傳 @{ Expires = <string> } 表示命中且可放行；$null 表示未命中（任何一關沒過都
+# 是 $null，呼叫端一律落回「每次問」，不是另一條放行路徑）。
+#   - scheme 必須 https（呼叫端在呼叫前已篩）。
+#   - 安全網（Test-NeverDedupHost）與結構檢查（Test-DedupEligible）仍套用——
+#     「使用者批准過這個 host」不蘊含「批准這次請求的 query/path」，也不蘊含
+#     「這個 host 不是人為填錯的本機/私網/第三方託管平台」。
+#   - 檔案 mtime 超過 12 小時或 expires 已過／缺／無法解析 → 視為不存在。
+#   - host 精確比對（大小寫/尾點/前後空白正規化後比對），不做 suffix。
+function Test-WebFetchPreapproved {
+    param([string]$HostName, [System.Uri]$Uri, [string]$RawUrl, [string]$CwdRaw)
+    try {
+        if (Test-NeverDedupHost $HostName) { return $null }
+        if (-not (Test-DedupEligible $Uri $RawUrl)) { return $null }
+
+        $cwdHash = Get-WebFetchCwdHash $CwdRaw
+        if (-not $cwdHash) { return $null }
+
+        # 2026-10-02（R-M2）：覆寫被拒絕或根本解析不出合法目錄 → 直接視為「沒有
+        # 預放行檔」，不退回 fallback（見 Resolve-WebFetchPreapproveDir 檔頭說明）。
+        $stateDir = Resolve-WebFetchPreapproveDir $env:GUARD_WEBFETCH_STATE_DIR (Join-Path ([IO.Path]::GetTempPath()) 'claude-guard-webfetch')
+        if (-not $stateDir) { return $null }
+        $file = Join-Path $stateDir "preapproved-$cwdHash.txt"
+        if (-not (Test-Path -LiteralPath $file)) { return $null }
+
+        # 2026-10-02（F4②）：預放行檔本身若是 reparse point（symlink／junction／
+        # hardlink 的部分形式會帶這個屬性），忽略該檔（視為不存在）——檔案內容
+        # 可能指向 agent 完全自控的另一個檔，繞過「這個目錄只准 hook／輔助腳本
+        # 寫入」的保護。
+        $item = $null
+        try { $item = Get-Item -LiteralPath $file -Force -ErrorAction Stop } catch { return $null }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+
+        # 2026-10-02（F4①）：mtime 在未來（age 為負）一律視為過期，不是「還很新」。
+        $mtime = $item.LastWriteTime
+        $age = (Get-Date) - $mtime
+        if ($null -eq $age -or $age.TotalHours -lt 0 -or $age.TotalHours -gt 12) { return $null }
+
+        $lines = @(Get-Content -LiteralPath $file -ErrorAction SilentlyContinue)
+        if (-not $lines -or $lines.Count -eq 0) { return $null }
+
+        $firstLine = "$($lines[0])".Trim()
+        if ($firstLine -inotmatch '^expires=(.+)$') { return $null }
+        $expiresRaw = $Matches[1].Trim()
+        $expiresDt = $null
+        try { $expiresDt = [DateTime]::Parse($expiresRaw, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+        if ((Get-Date) -gt $expiresDt) { return $null }
+        # 2026-10-02（F4③）：expires 欄位本身不得超過 mtime+12h——若 mtime 被（例如
+        # `touch`）持續刷新成「新鮮」，但 expires 是建檔當下寫入的遠期值，仍要擋下
+        # （否則 touch 能把一份遠期 expires 的核准無限延長生效期）。
+        if ($expiresDt -gt $mtime.AddHours(12)) { return $null }
+
+        # 2026-10-03（F12b，fix-3b，review-3 fatal 1 的內容層兜底——真正的防線）：
+        # 測試模式寫出的檔固定多帶一行 `testmode=1`（見 preapprove-webfetch.ps1 的
+        # F12b 註解）。若這個標記出現，但本行程（讀檔的這次 hook 呼叫）自己沒有設
+        # GUARD_WEBFETCH_STATE_DIR 覆寫，就直接拒收整份檔——不論這份檔是怎麼被
+        # 送進真實預設目錄的（junction、subst，或任何路徑把戲，見 F12a 註解的
+        # junction attack），只要讀檔的這個 hook 行程是「正常、沒有覆寫」的情境，
+        # 就不會採信。合法的測試呼叫（test-preapprove-script.ps1 的 T7、
+        # test-mcp-guard.ps1 的 (H) 段）一律會在呼叫 preapprove-webfetch.ps1 與
+        # guard-mcp.ps1 兩邊都設同一個 GUARD_WEBFETCH_STATE_DIR，不受影響。
+        $bodyLinesRaw = @($lines | Select-Object -Skip 1 | ForEach-Object { "$_".Trim() })
+        $hasTestModeMarker = $bodyLinesRaw -contains 'testmode=1'
+        if ($hasTestModeMarker -and [string]::IsNullOrWhiteSpace($env:GUARD_WEBFETCH_STATE_DIR)) {
+            Write-GovLog 'guard-mcp' 'ask' "WebFetch 預放行檔帶 testmode 標記而本行程無覆寫目錄，拒收（F12b，疑似測試模式檔外洩到真實目錄）"
+            return $null
+        }
+
+        $hostLines = @($bodyLinesRaw |
+            Where-Object { $_ -and $_ -ne 'testmode=1' -and -not $_.StartsWith('#') } |
+            ForEach-Object { $_.ToLowerInvariant().TrimEnd('.') })
+
+        if ($hostLines -notcontains $HostName) { return $null }
+
+        return @{ Expires = $expiresRaw }
+    } catch { return $null }
+}
+
 if ($tool -eq 'WebFetch') {
     $url = $data.tool_input.url
 
@@ -281,6 +407,16 @@ if ($tool -eq 'WebFetch') {
     # 其餘一律每次問。這一關必須在安全網之前——漏列白名單的失敗方向是「多問一次」
     # （變嚴），不需要靠安全網兜底也能保證不會靜默放行。
     if (-not (Test-DedupAllowlistHost $hostName)) {
+        # 【B，插在主閘門之前】host 不在永久白名單時，先查預放行檔——使用者已親手
+        # 為這個 cwd＋host 開過一個有時效的視窗。scheme 必須是 https（http 一律照舊
+        # 問，不查預放行檔）。命中 → allow；任何一關沒過 → 落回既有「每次必問」。
+        if ($uri.Scheme -eq 'https') {
+            $pre = Test-WebFetchPreapproved -HostName $hostName -Uri $uri -RawUrl $url -CwdRaw $data.cwd
+            if ($null -ne $pre) {
+                Write-GovLog 'guard-mcp' 'allow' "WebFetch preapproved：host『$hostName』命中預放行檔（到期 $($pre.Expires)）"
+                exit 0
+            }
+        }
         AskMcp "WebFetch 對外抓取網路內容（可能觸發 SSRF 或把 context 送到外部 URL），host『$hostName』不在去重白名單（主閘門），每次必問"
     }
 

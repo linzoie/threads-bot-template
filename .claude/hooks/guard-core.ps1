@@ -146,6 +146,89 @@ function Get-GuardVerdictSingle {
         # 'allow'（安全目標）與 $null（非刪除）都繼續往下檢查其他樣式
     }
 
+    # 2026-10-02（webfetch-preapproval spec §2「自我核准的縫」；2026-10-02 修補簡報
+    # R-M1 修正）：claude-guard-webfetch 目錄（WebFetch 預放行檔＋既有 session dedup
+    # state 共用）只准 guard-mcp.ps1 本身與使用者在終端親手執行的
+    # .governance/bin/preapprove-webfetch.ps1 碰——這兩者都不經過本 hook（guard-core
+    # 只管 Bash/PowerShell 工具呼叫）。agent 殼裡沒有合法理由寫入或代跑該腳本。
+    #
+    # 【R-M1 修正前的洞】原版兩條規則分別是「指令任何位置含讀取動詞才放行，否則
+    # 一律 deny」與「指令字面含 preapprove-webfetch.ps1 就一律 deny」。實測這兩條
+    # 誤殺大量日常治理指令：`git add/commit/diff …preapprove-webfetch.ps1`、
+    # `Get-Content .../preapprove-webfetch.ps1`（讀原始碼）、
+    # `rg -n claude-guard-webfetch .governance`、
+    # `Select-String -Path $env:TEMP/claude-guard-webfetch/...`、
+    # `Get-Content …\x.txt 2>$null`（`>` 被當成寫入動詞）、`(Get-Item …).Length`
+    # （Get-Item 不在讀取動詞白名單）全部被誤擋。
+    #
+    # 【修法】兩條規則改成只認「形狀」，不是「含有字面字串就處置」：
+    #   - 腳本名規則只擋「呼叫形狀」：指令字面含 preapprove-webfetch 這個子字串
+    #     **且**該處位於呼叫位置（段首或殼分隔符之後緊接 pwsh/powershell、呼叫
+    #     運算子 & 後接空白、dot-source 的 . 後接空白或路徑分隔符，或指令含
+    #     -File 旗標）。只是「提到」這個檔名（git add/commit/diff、Get-Content
+    #     讀原始碼、rg/Select-String 搜尋）不構成呼叫形狀，放行。
+    #   - 目錄規則只擋「寫入形狀」：明確的寫入動詞／API（Set-Content、Out-File、
+    #     Add-Content、New-Item、Copy-Item／copy／cp、Move-Item、Rename-Item、
+    #     Clear-Content、Set-ItemProperty、mklink、Tee-Object／tee、touch、
+    #     python 的 open(、[IO.File]::Write*、(Get-Item …).LastWriteTime=），
+    #     或重導向的**目標**本身含這個目錄字面（`2>$null` 這類 stderr 丟棄不算
+    #     寫入——目標是 `$null`，不含目錄字面，天然就不會比對到）。沒有寫入
+    #     形狀＝放行，即使指令字面提到這個目錄（讀取／列舉／搜尋／查屬性都是
+    #     合法診斷用途）。
+    #
+    # 【F3，已知限制，明文記錄，不是沒寫好】字串比對結構上擋不住「執行期才組出
+    # 字面字串」的繞法：變數/字串拼接（$a+$b、Join-Path 拼目錄名、bash
+    # `$a-$b`）、萬用字元（`?`／`*` 取代字元讓字面不連續）、base64 等編碼、
+    # Get-ChildItem 萬用字元取腳本物件後再呼叫。這些攻擊在這一層**不會出現**
+    # 「claude-guard-webfetch」或「preapprove-webfetch」這兩個連續子字串，沒有
+    # 東西可比對——這是這一層（Bash/PowerShell 工具呼叫的靜態字面比對）設計射程
+    # 的邊界，不是規則寫漏。真正的防線在
+    # .governance/bin/preapprove-webfetch.ps1 本身的互動式閘門（F5：非 TTY 或
+    # 輸入/輸出被重導一律拒絕且不寫檔）——agent 殼呼叫腳本時 stdin/stdout 一定是
+    # 重導的，就算字面比對被繞過，腳本自己仍會拒絕執行。已固化進
+    # guard-cases.jsonl 的 webfetch-preapprove-bypass-* 案例裡，字面抓不到的那些
+    # expect 標為 pass 並在 note 寫明此限制，不留假紅燈也不假裝擋得住。
+    #
+    # 【F3 措辭修正，2026-10-03 修補簡報 fix-3】上一段「真正的防線在 F5」只對
+    # 「繞過這一層、但最終仍跑進 preapprove-webfetch.ps1 本體」的案例（腳本名
+    # 拆字串拼接／bash glob／Get-ChildItem 取物件再呼叫）成立——這些繞法會
+    # 真的執行到那支腳本，F5 互動式閘門攔得住。但另外四條直接把寫入動作對準
+    # claude-guard-webfetch 目錄字面的繞法（目錄名拼接、bash 變數拼接、萬用
+    # 字元、base64 編碼路徑）根本不經過那支腳本，F5 對它們沒有意義——這四條
+    # 「直接寫入該目錄沒有結構性防線（同帳號程序本就能寫），此層只是摩擦＋
+    # 稽核」，殘餘風險由 never-dedup 安全網與 12 小時上限兜底。另外，F5 本身的
+    # 測試逃生口（GUARD_PREAPPROVE_TEST_MODE）已限制為非預設目錄且帶 testmode
+    # 標記（F9／F12：2026-10-03 fix-3b 補上 reparse point／8.3 短名的路徑層
+    # 檢查，以及 guard-mcp.ps1 讀檔時的內容層標記兜底——review-3 實測一個名字
+    # 無害的 junction 就能讓 F9 的純字串比對通過、卻把檔案實際寫進真實預設
+    # 目錄，詳見 preapprove-webfetch.ps1 的 F12 註解），否則該逃生口本身也會
+    # 是一條能被 agent 殼（繞過這一層字串比對後）觸發的旁路。逐條措辭見
+    # guard-cases.jsonl 與 .governance/specs/2026-10-02-webfetch-preapproval.md
+    # 「2026-10-03 fix-3／fix-3b」段。
+    #
+    # 【F13，同輪 review-3b 補】覆寫目錄葉名含萬用字元字元類（[ ] * ?）的繞法——
+    # 路徑層由 preapprove-webfetch.ps1 的 Test-SafeTestStateDir 直接拒收該字元類，
+    # 寫入層所有可用 -LiteralPath 的 cmdlet 已全部改用；這兩層同樣都在腳本本體
+    # 內，不經過本 hook，與上面 F12 同理不是這一層的射程。
+    $wfInvokeShapeRx = '(^|;|&&|\|\||\||&)\s*(pwsh|powershell)(\.exe)?\b' +
+                        '|(^|;|&&|\|\||\||&)\s*&(?=\s)' +
+                        '|(^|;|&&|\|\||\||&)\s*\.(?=[\s\\/])' +
+                        '|-File\b'
+    if (($cmd -imatch 'preapprove-webfetch') -and ($cmd -imatch $wfInvokeShapeRx)) {
+        return @{ decision = 'deny'; why = 'preapprove-webfetch.ps1 只准使用者在終端親手執行，agent 殼裡沒有合法理由代跑該腳本（會自我核准 WebFetch 預放行清單）' }
+    }
+
+    if ($cmd -imatch 'claude-guard-webfetch') {
+        $wfWriteVerbRx = '\b(set-content|out-file|add-content|new-item|copy-item|move-item|rename-item|clear-content|set-itemproperty|mklink|tee|cp|copy|touch)\b' +
+                         '|\[io\.file\]::write\w*' +
+                         '|\bopen\s*\(' +
+                         '|\(get-item[^)]*\)\.lastwritetime\s*='
+        $wfRedirectToDirRx = '>{1,2}\s*[^;&|\r\n]*?claude-guard-webfetch'
+        if (($cmd -imatch $wfWriteVerbRx) -or ($cmd -imatch $wfRedirectToDirRx)) {
+            return @{ decision = 'deny'; why = 'claude-guard-webfetch 目錄（WebFetch 預放行檔）偵測到寫入形狀（寫入動詞／API 或重導向目標落在此目錄），只准使用者在終端親手執行 .governance/bin/preapprove-webfetch.ps1 寫入' }
+        }
+    }
+
     # ──────────────────────────────────────────────────────
     # 3) DENY 樣式：災難級、不可逆
     # ──────────────────────────────────────────────────────
@@ -306,8 +389,88 @@ function Get-GuardVerdictSingle {
         # 迴圈／變數／殼包裹／全路徑／大小寫都看得到。刻意用 ask 不用 deny：commit 訊息或 grep 提到這些字也會被問一次，
         # 但那是低頻且可放行的；deny 會連治理工作本身一起鎖死（紅隊實測 14 條）。合法收尾路徑＝ .governance/bin/with-child.mjs。
         # 不抓裸 `kill`（bash builtin 的 kill %1／PowerShell 別名太常見於無害脈絡）；PowerShell 別名 spps 抓。
-        @{ rx = '(^|[\s;&|(`"''/\\=])(taskkill|tskill|pkill|killall|stop-process|spps)(\.exe)?(?![\w.-])'; why = '程序終止指令（2026-09-19 事故）：只准用 with-child.mjs 收自己登記的 PID；按名稱／篩選／埠／迴圈／變數殺一律先問' },
-        @{ rx = '\bwmic(\.exe)?\b[^;&|]*\bprocess\b[^;&|]*\b(delete|call\s+terminate)\b|\b(invoke-cimmethod|invoke-wmimethod)\b[^;&|]*\bterminate\b|\.(kill|terminate|closemainwindow)\s*\('; why = '程序終止（WMI／CIM Terminate、.Kill()／.CloseMainWindow()）：只准用 with-child.mjs 收自己登記的 PID' }
+        # 2026-10-03（setx-fix）：前綴字元類補 `{`（`& {taskkill ...}` 腳本區塊）與 `:`
+        # （`-FilePath:taskkill` 這類冒號綁定），與下方 setx 規則同一個洞一併補。
+        @{ rx = '(^|[\s;&|(){`"''/\\=:])(taskkill|tskill|pkill|killall|stop-process|spps)(\.exe)?(?![\w.-])'; why = '程序終止指令（2026-09-19 事故）：只准用 with-child.mjs 收自己登記的 PID；按名稱／篩選／埠／迴圈／變數殺一律先問' },
+        @{ rx = '\bwmic(\.exe)?\b[^;&|]*\bprocess\b[^;&|]*\b(delete|call\s+terminate)\b|\b(invoke-cimmethod|invoke-wmimethod)\b[^;&|]*\bterminate\b|\.(kill|terminate|closemainwindow)\s*\('; why = '程序終止（WMI／CIM Terminate、.Kill()／.CloseMainWindow()）：只准用 with-child.mjs 收自己登記的 PID' },
+        # 2026-10-03（setx-guard 補丁；規格權威見 .governance/specs/2026-10-03-persistent-env-guard.md）：
+        # 持久環境變數／登錄檔 Environment 鍵寫入——與程序終止同級（AGENTS.md「機器狀態」規則，
+        # 2026-09-19 事故後）：不得改永久環境變數、登錄檔。裁量權在使用者，故用 ask 不用 deny。
+        #
+        # 2026-10-03 setx-fix（第三輪，opus xhigh 與第二位 opus high 雙審查後的修補腿）：
+        # 【效能】原版多條規則用 [\s\S]*? 跨段 lazy 掃描判定「A...之後某處出現 B」，在無匹配時
+        # 逼引擎窮舉所有切點，32–160 KB 輸入會讓單條規則吃到 14–327 秒（實測），settings 沒設
+        # hook timeout＝預設 600 秒，超長輸入可讓整支 guard-bash 連 deny 級規則一起 fail-open。
+        # 本輪改法：①本區塊最前面加一道輸入長度保險（64 KB 門檔，排在 DENY 樣式與前面的
+        # ask 檢查之後——只保護其後的規則不會被餵到那麼長還能跑完，不是整支 guard-core 的
+        # 全部規則）；②SetEnvironmentVariable 改用「不跨括號／逗號的字元類＋一層巢狀括號」取代
+        # [\s\S]*?，各參數段的切點是決定性的（遇到 , ( ) 就停），不會觸發回溯重試；③登錄檔
+        # cmdlet／OpenSubKey 系列改成 ^(?=...)(?=...) 兩個獨立 lookahead 的「同時出現」判定
+        # （已有 python winreg 規則先例），^ 錨點只讓引擎從位置 0 試一次，不會對每個起始位置
+        # 重試整段掃描，故為 O(n)。reg add/delete/copy（外部行程）**不**放寬成同時出現——放寬會
+        # 讓 `reg add 其他路徑; reg query HKCU\Environment` 這類無害指令被誤殺（N05/rn11 已證實）。
+        # 改法是在原本的「同一段內」掃描中加一個否定前瞻：逐字元消耗時，若前方又出現另一個
+        # `reg <subcommand>`（代表另一條獨立 reg 指令開始了）就停止消耗——這樣 caret 續行／
+        # 換行轉 ; 的單一 reg add 仍可跨越人工插入的 ; 找到路徑（reg-guard-reg-caret-continuation
+        # 迴歸案例），但兩條不同的 reg 指令之間不會互相洩漏。
+        # 【SetEnvironmentVariable 閘門】改為「非 Process 即 ask」：錨點是識別字
+        # setenvironmentvariable 本身（可選前置反斜線＋引號、可選 .Invoke），不再要求
+        # [Environment]:: 前綴——型別參考用變數接、用括號包、用轉型字串呼叫都一樣命中，因為
+        # 命中與否只看呼叫語法本身，不看前綴。找到呼叫後，第一、二個參數段（各可為一層巢狀
+        # 括號、或完整引號字串——引號內的逗號/括號視為不透明整塊消耗，不會被誤判成參數分隔，
+        # 這是 setenv-guard-comma-in-value-machine／-neg-two-args-comma 兩個既有迴歸案例的
+        # 關鍵）確認是三參數呼叫，第三段用否定前瞻比對白名單——只有字面 Process／0／
+        # [EnvironmentVariableTarget]::Process（允許前後空白／一層括號包覆、System. 前綴、
+        # 大小寫不拘）算安全，其餘（變數、列舉轉整數、十六進位、引號內襯字、行內註解、反引號
+        # 續行殘留、反引號跳脫雙引號殘留）一律不在白名單內→ask，不需要窮舉每種繞法的寫法，
+        # 繞法只要不是那三種字面就自動落在「否則」。所有分隔符都用 [\s;]*（不是 \s*）：A1 把
+        # 原本的換行轉成 「 ; 」，若只認 \s* 會在跨行呼叫時被插入的 ; 卡斷（已修復的迴歸：
+        # setenv-guard-multiline-user／-neg-multiline-process、reg-guard-opensubkey-multiline）。
+        # 【登錄檔 cmdlet】Set/New/Remove/Clear/Rename/Copy/Move-ItemProperty 與別名
+        # sp/ni/rp/clp/rnp/cpp/mp、Set-Item／Remove-Item 與別名 si/ri/rm/del/erase 任一出現
+        # ＋HKCU 系（HKCU:\、HKCU:/、Registry::HKEY_CURRENT_USER\、Registry::HKCU\ 皆算同一
+        # 分隔字元類）／HKU\<SID>\Environment／HKEY_USERS\<SID>\Environment／HKLM Session
+        # Manager\Environment 任一出現，指令任何位置皆可、不要求相鄰——涵蓋管線先取路徑再
+        # Set-ItemProperty、路徑存變數、New-PSDrive 把 Environment 設成磁碟機根再用別名路徑寫
+        # 入等「字面有出現、只是位置分散」的繞法。刻意不含裸 New-Item（只含 New-ItemProperty
+        # 與別名 ni）：含了會讓「讀 Environment；New-Item 建全新檔案」這類無害指令被誤殺。
+        # 【OpenSubKey／CreateSubKey】同樣改同時出現判定：'Environment' 當第二參數（含尾反
+        # 斜線／正斜線變體）出現＋.SetValue(／.DeleteValue(／.DeleteSubKeyTree(／.DeleteSubKey(
+        # 任一出現，不要求相鄰。另外 DeleteSubKeyTree／DeleteSubKey 也可能直接對 'Environment'
+        # 呼叫（不經 OpenSubKey，例如 CurrentUser.DeleteSubKeyTree('Environment')），獨立補一條
+        # 不需同時出現判定的直接呼叫規則。
+        # 【新增涵蓋】regini（內容在外部 .ini 檔，靜態不可判定，比照 reg import/regedit /s 一律
+        # ask）；StdRegProv CIM 方法（StdRegProv／寫入類方法名／environment 三者同時出現）；
+        # reg add/delete/copy 與 Set-ItemProperty 系都補上 HKU\<SID>\Environment 變體。
+        # 【已知限制（字串層結構性，與 webfetch spec F3 同性質，不留假紅燈）】
+        #   - setx／cmdlet 名稱被 bash `\`（V02）或反引號（V01/rv02/rv14）拆成不連續子字串
+        #     （se\etx、se`tx、Env`ironment）——這層會把字元拆開再由殼/引擎還原，字串比對
+        #     看不到還原後的樣子；要修須加一道全域「剝反引號／反斜線」正規化，超出本次只動
+        #     規則區塊的範圍，留作已知限制。
+        #   - bash 空字串相接拆字（se''tx，V03）——同上，需要全域正規化才能收。
+        #   - cmd 零長度子字串前綴（%ComSpec:~0,0%setx，V07）——cmd 變數展開在執行期才發生。
+        #   - Get-Command 搭配萬用字元解析指令名（se?x／se?x.exe，V34／V34b）——哪個檔案會被
+        #     萬用字元比對到是執行期才知道的，字串層看不到候選集合。
+        #   - 路徑含 `..` 相對片段（HKCU:\Software\..\Environment，V22）或萬用字元
+        #     （HKCU:\Environmen?，V23）——會命中 hkcu 開頭但中間不是純分隔字元，不在本輪
+        #     HKCU 分隔字元類的射程；加萬用字元/相對路徑正規化風險大於效益，留作已知限制。
+        #   - 執行期字串拼接組出函式名、型別、或登錄檔路徑的「子字串」本身不相鄰（例如先把
+        #     hive 字串切兩半各自用 + 接起來才傳進 SetValue／iex 再拼出 setx）——字面上找不到
+        #     完整關鍵字，結構性不可偵測；型別或成員改走 Reflection（GetMethod+Invoke）間接呼叫
+        #     也屬此類（若仍直接寫出方法名字面如 .'SetEnvironmentVariable'(...) 或
+        #     ([Environment])::SetEnvironmentVariable(...) 則本輪規則仍會命中，不算此限制）。
+        @{ rx = '^[\s\S]{65536,}'; why = '指令字串超過 64 KB，靜態分析在此長度不可靠（2026-10-03 審查實測：舊版規則在 32–160 KB 輸入會耗時 14–327 秒，足以讓整支 guard-bash fail-open）：請拆成較短指令，或確認是否真的需要如此長的單一指令' },
+        @{ rx = '(^|[\s;&|(){`"''/\\=:])setx(\.exe)?(?![\w.-])'; why = '持久環境變數／登錄檔 Environment 寫入（2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '\bsetenvironmentvariable[\s;]*\\?[''"]?[\s;]*(\.[\s;]*invoke)?[\s;]*\((?:\\?[''"][^''"]*\\?[''"]|\([^()]*\)|[^,()''"])*,(?:\\?[''"][^''"]*\\?[''"]|\([^()]*\)|[^,()''"])*,(?![\s;]*\(?[\s;]*\\?(?:0|process|[''"]process\\?[''"]|\[(?:system\.)?environmentvariabletarget\][\s;]*::[\s;]*process)\\?[\s;]*\)?[\s;]*\))'; why = '持久環境變數／登錄檔 Environment 寫入：SetEnvironmentVariable 三參數呼叫且第三參數非字面 Process／0／[EnvironmentVariableTarget]::Process（2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '^(?=[\s\S]*(?<![\w-])(set-itemproperty|new-itemproperty|remove-itemproperty|clear-itemproperty|rename-itemproperty|copy-itemproperty|move-itemproperty|sp|ni|rp|clp|rnp|cpp|mp|set-item|remove-item|si|ri|rm|del|erase)(?![\w-]))(?=[\s\S]*((hkcu|hkey_current_user)[:\\/]*environment\b|(hku|hkey_users)[:\\/]*[^\\/;&|()]{0,64}[\\/]environment\b|(hklm|hkey_local_machine)[:\\/]*system[\\/]+(currentcontrolset|controlset\d+)[\\/]+control[\\/]+session manager[\\/]+environment\b|session manager[\\/]+environment\b))'; why = '持久環境變數／登錄檔 Environment 寫入（登錄檔 cmdlet 與 Environment 鍵同時出現；2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '\breg(\.exe)?\s+(add|delete|copy)\b(?:(?!\breg(\.exe)?\s+\w)[^&|])*((hkcu|hkey_current_user)[\\/]+environment\b|(hku|hkey_users)[\\/]+[^\\/;&|()]{0,64}[\\/]+environment\b|session manager[\\/]+environment\b)'; why = '持久環境變數／登錄檔 Environment 寫入（2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '\breg(\.exe)?\s+(import|restore|load)\b|\bregedit(\.exe)?\b[^;&|]*(\s[/-]s\b|\.reg\b)|\bregini(\.exe)?\b'; why = '登錄檔匯入／regini（內容靜態不可判定、可寫入 Environment；2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '\[(microsoft\.win32\.)?registry\]::setvalue\s*\([^()]*environment'; why = '持久環境變數／登錄檔 Environment 寫入（2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '^(?=[\s\S]*(opensubkey|createsubkey)[\s;]*\([\s;]*[''"]environment[\\/]*[''"])(?=[\s\S]*\.[\s;]*(setvalue|deletevalue|deletesubkeytree|deletesubkey)[\s;]*\()'; why = '持久環境變數／登錄檔 Environment 寫入（OpenSubKey／CreateSubKey 與 SetValue／DeleteValue／DeleteSubKeyTree 同時出現；2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '\.[\s;]*(deletesubkeytree|deletesubkey)[\s;]*\([\s;]*[''"]environment[\\/]*[''"]'; why = '持久環境變數／登錄檔 Environment 寫入（直接呼叫 DeleteSubKeyTree／DeleteSubKey 的 Environment 鍵引數；2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '\bwmic(\.exe)?\b[^;&|]*\benvironment\b[^;&|]*\b(create|set|delete)\b|\b(new|set|remove)-ciminstance\b[^;&|]*\bwin32_environment\b|\bset-wmiinstance\b[^;&|]*\bwin32_environment\b|\bwin32_environment\b[\s\S]*?\b((set|remove)-ciminstance|remove-wmiobject|set-wmiinstance)\b|\bwin32_environment\b[\s\S]*?\.(put|delete)\s*\(|\[wmiclass\][^;&|]*\bwin32_environment\b'; why = '持久環境變數寫入（WMI／CIM Win32_Environment；2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '^(?=[\s\S]*\bstdregprov\b)(?=[\s\S]*\b(setstringvalue|setdwordvalue|setexpandedstringvalue|setmultistringvalue|setbinaryvalue|deletevalue|deletekey|createkey)\b)(?=[\s\S]*\benvironment\b)'; why = '持久環境變數／登錄檔 Environment 寫入（CIM StdRegProv 寫入類方法；2026-09-19 機器狀態規則）：只准使用者親手改' },
+        @{ rx = '^(?=[\s\S]*winreg\b)(?=[\s\S]*environment)(?=[\s\S]*\b(setvalue(ex)?|deletevalue)\s*\()'; why = '持久環境變數／登錄檔 Environment 寫入（python winreg；2026-09-19 機器狀態規則）：只准使用者親手改' }
     )
     foreach ($p in $askPatterns) {
         if ($cmd -imatch $p.rx) { return @{ decision = 'ask'; why = $p.why } }

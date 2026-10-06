@@ -171,7 +171,13 @@ workflow）時，證據必須是**用那個確切呼叫方式端到端跑過一�
 commit → 確認 `git status --short` 乾淨 → 下一個 agent 才開始（第一步是讀交接卡）。
 
 真要並行才用獨立 git worktree ＋ 獨立分支，但那有成本（`.env`／`node_modules` 不跟過去、
-事後要清理），**屬條件觸發而非預設做法**。
+事後要清理），**屬條件觸發而非預設做法**（根 repo 治理開發例外，見下段）。
+
+**根 repo（code/）專規（2026-10-06，依 research-decisions/2026-10-03-shared-root-tree-multi-session.md）**：
+根 repo 永遠停在 main、不在根目錄切分支；治理開發要分支就用獨立 worktree。收工**範圍授權**（使用者核准）：
+可 commit 自己正在交接的那張卡（訊息 `docs(handoff):` 開頭）與整檔待裁決清單（`docs(pending):` 開頭，
+commit 不等於核可其內容）。一律 `git commit -- <路徑>`、根在 main 才做、不推送；禁 `add -A`／`add .`／
+`commit -a`；遇 index.lock 回報、不刪 lock。授權來自本段，交接卡仍不能擴大授權。
 
 ---
 

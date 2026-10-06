@@ -68,6 +68,37 @@ function Write-GovLog([string]$hook, [string]$decision, [string]$why, [string]$t
     } catch { }
 }
 
+# 2026-10-02（webfetch-preapproval spec §2「自我核准的縫」；2026-10-02 修補簡報
+# F6）：claude-guard-webfetch 目錄（WebFetch 預放行檔＋既有 session dedup
+# state）只准 guard-mcp.ps1 本身與使用者在終端親手執行的
+# .governance/bin/preapprove-webfetch.ps1 寫入；Write／Edit／MultiEdit 對該目錄
+# 一律 DENY（比下面 S4a 的治理檔保護更嚴格——那組是 ASK，因為使用者可能真的要
+# 改治理檔，這裡沒有那個正當情境）。
+#
+# 正規化後再比對（F6）：小寫化、正斜線化、去 `\\?\`／`//?/` 長路徑前綴、去尾點，
+# 讓 `\\?\C:\...\CLAUDE-GUARD-WEBFETCH\x`、大小寫變體、尾點變體都躲不掉——原版
+# 只比對原始字面，這些變形未實測過，審查列為待補。
+# 邊界只要求「前面」是斜線或字串起點，**不要求後面也接斜線**（能命中目錄本身，
+# 或尾點被去除後落在字串結尾的情況）；但後面若有其他字元，仍要求是斜線或字串
+# 結尾，避免誤殺單純提到這個詞彙的一般檔名／文件（例如
+# notes-about-claude-guard-webfetch-design.md 前後接的是連字號，不是這個目錄
+# 底下的檔案）。
+function Test-PathHasWebfetchDir([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    $n = $path.ToLowerInvariant()
+    $n = $n -replace '^\\\\\?\\', ''
+    $n = $n -replace '^//\?/', ''
+    $n = $n -replace '\\', '/'
+    $n = $n.TrimEnd('.')
+    return [bool]($n -match '(^|/)claude-guard-webfetch(/|$)')
+}
+if (Test-PathHasWebfetchDir $fp) {
+    Write-GovLog 'guard-write' 'deny' '寫入 WebFetch 預放行檔目錄（claude-guard-webfetch）' "$fp"
+    [Console]::Error.WriteLine('[BLOCKED] guard-write 攔截：claude-guard-webfetch 目錄只准使用者親手執行 .governance/bin/preapprove-webfetch.ps1 寫入，Write/Edit/MultiEdit 一律拒絕。')
+    [Console]::Error.WriteLine("  檔案：$fp")
+    exit 2
+}
+
 if ($fp -imatch $protectRx) {
     Write-GovLog 'guard-write' 'ask' '寫入受保護治理檔' "$fp"
     $reason = "使用者硬規則「保護治理層自身」：正在寫入治理檔（hook/settings/agent/governance）" +
