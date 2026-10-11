@@ -71,11 +71,86 @@ function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
     } catch { }
 }
 
+# ── 2026-10-10 D5：終止類 deny 的 PreToolUse 計數斷路器（spec 2026-10-10-termination-guard-redesign.md v0.3）──
+# 同一 (session_id, agent_id) 第二次撞到終止類 deny（不論措辭）就寫一筆 taint 到與 record-security-warning
+# 同一份狀態檔，guard-dispatch-taint 下次派工會問一次。主迴圈（stdin 沒有 agent_id）不計入。
+# 狀態目錄解析與 record-security-warning 的 Get-TaintStateDir 同一套（TAINT_STATE_DIR 只認 TEMP 且拒 junction）。
+# 全程 fail-open：計數失敗絕不影響 deny 本身（deny 先於計數，計數在 exit 2 之前最後做）。
+function Get-TaintStateDirForBash {
+    $default = Join-Path $HOME '.claude\session-state'
+    if (-not $env:TAINT_STATE_DIR) { return $default }
+    try {
+        $c = [IO.Path]::GetFullPath($env:TAINT_STATE_DIR)
+        $tmp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        if ($c.StartsWith($tmp, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-NoReparseUnderTemp $c $tmp)) { return $c }
+        return $default
+    } catch { return $default }
+}
+function Get-SafeKeyForBash([string]$s) {
+    if ([string]::IsNullOrWhiteSpace($s)) { return '' }
+    $k = $s -replace '[^A-Za-z0-9_.-]', '_'; $k = $k -replace '\.{2,}', '.'; $k = $k.Trim('.')
+    if ($k.Length -gt 80) { $k = $k.Substring(0, 80) }
+    return $k
+}
+# ts 正規化：與 record-security-warning.ps1／guard-dispatch-taint.ps1 的 ConvertTo-TsKey 同一份（階段 1 審查 minor-7）。
+# 重寫既有 entries 時，pwsh 7 會把舊格式的純 ISO ts 讀成 [DateTime]，再序列化就悄悄改掉主鍵。
+function ConvertTo-TsKeyForBash($v) {
+    if ($null -eq $v) { return '' }
+    if ($v -is [datetime]) { return $v.ToUniversalTime().ToString('o') }
+    if ($v -is [datetimeoffset]) { return $v.UtcDateTime.ToString('o') }
+    return "$v"
+}
+function Write-TerminationDenyCount([string]$why) {
+    try {
+        $agentId = ''
+        foreach ($cand in @("$($data.agent_id)", "$($data.subagent_id)")) { if (-not [string]::IsNullOrWhiteSpace($cand)) { $agentId = $cand; break } }
+        if (-not $agentId) { return }   # 主迴圈不計
+        $sidKey = Get-SafeKeyForBash "$($data.session_id)"; if (-not $sidKey) { $sidKey = 'no-session' }
+        $agentKey = Get-SafeKeyForBash $agentId
+        $dir = Get-TaintStateDirForBash
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $counter = Join-Path $dir "termdeny-$sidKey-$agentKey.txt"
+        $n = 0
+        if (Test-Path -LiteralPath $counter) { $raw = (Get-Content -LiteralPath $counter -Raw).Trim(); if ($raw -match '^\d+$') { $n = [int]$raw } }
+        $n++
+        Set-Content -LiteralPath $counter -Value "$n" -Encoding utf8
+        [Console]::Error.WriteLine("  [D5] 本 agent 第 $n 次撞到終止類 deny（第 2 次起寫 taint，下次派工會問使用者）")
+        if ($n -lt 2) { return }
+        $f = Join-Path $dir "taint-$sidKey.json"
+        $entries = @(); $prompted = ''
+        if (Test-Path -LiteralPath $f) {
+            try { $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json
+                  if ($null -ne $j) { $entries = @($j.entries | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject][ordered]@{ ts = (ConvertTo-TsKeyForBash $_.ts); hook_event = "$($_.hook_event)"; agent_id = "$($_.agent_id)"; snippet = "$($_.snippet)" } }); $prompted = (ConvertTo-TsKeyForBash $j.prompted_for) } } catch { $entries = @(); $prompted = '' }
+        }
+        $ts = (Get-Date).ToUniversalTime().ToString('o') + '#' + ([guid]::NewGuid().ToString('N').Substring(0, 4))
+        $entry = [pscustomobject][ordered]@{ ts = $ts; hook_event = 'PreToolUse-deny'; agent_id = $agentId; snippet = "機器狀態類指令（終止／登記目錄／EncodedCommand）第 $n 次被守門擋下（guard-bash D5 計數；類別：$why）" }
+        $entries = @($entries) + @($entry)
+        if ($entries.Count -gt 50) { $entries = @($entries[($entries.Count - 50)..($entries.Count - 1)]) }
+        $out = [ordered]@{ session_id = "$($data.session_id)"; entries = @($entries); prompted_for = $prompted }
+        [IO.File]::WriteAllText($f, ($out | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding $false))
+    } catch { }
+}
+
 function Deny([string]$why) {
     Write-GovLog 'guard-bash' 'deny' $why
     [Console]::Error.WriteLine("[BLOCKED] guard 攔截危險指令：$why")
-    [Console]::Error.WriteLine("  指令內容：$cmd")
-    [Console]::Error.WriteLine("  此類指令一律由使用者本人於終端機手動執行，不由 Claude 代行。")
+    if ($why -match '程序終止|with-child 登記目錄|WITH_CHILD_DIR') {
+        # 2026-10-10 機器狀態類（spec v0.3 D1／R1；三類都計入 D5）：不回顯指令原文（memory safety-classifier-cuts-payload-echo），
+        # 結語依類別印改道說明（階段 1 審查 nit-12：R1 與 EncodedCommand 原本共用終止類結語，不對題）。
+        [Console]::Error.WriteLine("  （此類指令原文不回顯；長度 $($cmd.Length) 字元）")
+        if ($why -match 'with-child 登記目錄|WITH_CHILD_DIR') {
+            [Console]::Error.WriteLine("  登記目錄只能由 node .governance/bin/with-child.mjs run 寫入（之後由使用者親手 adopt）。要讀登記：ls／cat／Get-Content 不帶重導向即可；要改登記內容或換目錄：在對話裡說明理由請使用者裁定。")
+        } elseif ($why -match 'EncodedCommand') {
+            [Console]::Error.WriteLine("  改走明碼：把指令寫進 .ps1 以 -File 執行，或直接用 -Command 明碼（守門看得到內容才能判定）。")
+        } else {
+            [Console]::Error.WriteLine("  只是要提到這些字（commit 訊息／搜尋／文件）：改用 Grep／Read 工具，或先把文字寫進檔案再以 git commit -F、add-guard-case -CommandFile、-File 傳入，指令行不含這些字。")
+            [Console]::Error.WriteLine("  真的要終止程序：唯一合法路徑是 node .governance/bin/with-child.mjs stop <pid>（只對本 session 登記過的 PID）。要動不是你起的程序：在對話裡向使用者說明（程序名、PID、StartTime、理由、不動會怎樣）並等文字回覆；子 agent 則停止該項工作並回傳 needs_user_machine_action 欄位。不要改寫指令繞過本規則。")
+        }
+        Write-TerminationDenyCount $why
+    } else {
+        [Console]::Error.WriteLine("  指令內容：$cmd")
+        [Console]::Error.WriteLine("  此類指令一律由使用者本人於終端機手動執行，不由 Claude 代行。")
+    }
     exit 2
 }
 

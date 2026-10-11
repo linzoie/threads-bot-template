@@ -83,18 +83,45 @@ function Write-GovLog([string]$hook, [string]$decision, [string]$why, [string]$t
 # 結尾，避免誤殺單純提到這個詞彙的一般檔名／文件（例如
 # notes-about-claude-guard-webfetch-design.md 前後接的是連字號，不是這個目錄
 # 底下的檔案）。
-function Test-PathHasWebfetchDir([string]$path) {
-    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+# 2026-10-10（termination-guard 階段 1 審查 minor-8）：兩個目錄保護共用同一個正規化。除了原本的長路徑前綴、
+# 小寫、正斜線、整串尾點之外，補 Win32 會自己吃掉的三種寫法——**每個**路徑元件的尾點／尾空白
+# （`with-child.\x`、`with-child \x`）、`.` 元件（`session-state\.\with-child`）、連續斜線（雙反斜線寫法）。
+# 殘餘（明文）：8.3 短名（SESSIO~1）要查磁碟才解得開，這一層不做。
+function Get-GuardNormalizedPath([string]$path) {
     $n = $path.ToLowerInvariant()
     $n = $n -replace '^\\\\\?\\', ''
     $n = $n -replace '^//\?/', ''
     $n = $n -replace '\\', '/'
-    $n = $n.TrimEnd('.')
+    $n = $n -replace '/+', '/'
+    $n = $n -replace '(?<=/)\.(?=/)', ''      # /./ 元件
+    $n = $n -replace '/+', '/'
+    $n = $n -replace '[. ]+(?=/|$)', ''        # 每個元件的尾點／尾空白（含整串尾端）
+    return $n
+}
+function Test-PathHasWebfetchDir([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    $n = Get-GuardNormalizedPath $path
     return [bool]($n -match '(^|/)claude-guard-webfetch(/|$)')
 }
 if (Test-PathHasWebfetchDir $fp) {
     Write-GovLog 'guard-write' 'deny' '寫入 WebFetch 預放行檔目錄（claude-guard-webfetch）' "$fp"
     [Console]::Error.WriteLine('[BLOCKED] guard-write 攔截：claude-guard-webfetch 目錄只准使用者親手執行 .governance/bin/preapprove-webfetch.ps1 寫入，Write/Edit/MultiEdit 一律拒絕。')
+    [Console]::Error.WriteLine("  檔案：$fp")
+    exit 2
+}
+
+# 2026-10-10（spec 2026-10-10-termination-guard-redesign.md v0.3 D2 R1）：with-child 登記目錄
+# （session-state/with-child）只准 with-child run 或使用者親手 adopt 寫入；Edit/Write/MultiEdit 一律 DENY。
+# 攻擊語料 registry-1～6 證實現況零規則（偽造登記＝之後合法 stop 殺掉任意程序）。Bash 殼層寫入由 guard-core R1 擋。
+function Test-PathHasWithChildRegistry([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    $n = Get-GuardNormalizedPath $path
+    # 雙反斜線寫法（C:\\Users\\…\\session-state\\with-child\\x）正規化後曾是兩個斜線、單一 / 會漏（實測一次）；現由正規化收斂連續斜線
+    return [bool]($n -match '(^|/)session-state/with-child(/|$)')
+}
+if (Test-PathHasWithChildRegistry $fp) {
+    Write-GovLog 'guard-write' 'deny' '寫入 with-child 登記目錄（session-state/with-child）' "$fp"
+    [Console]::Error.WriteLine('[BLOCKED] guard-write 攔截：with-child 登記目錄只准 with-child run 或使用者親手 adopt 建立，Write/Edit/MultiEdit 一律拒絕（偽造登記＝之後能合法終止任意程序）。')
     [Console]::Error.WriteLine("  檔案：$fp")
     exit 2
 }

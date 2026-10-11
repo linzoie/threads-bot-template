@@ -604,10 +604,16 @@ function Get-GuardVerdictSingle {
     # adapter 走這條）對長空白是平方級——63 KB 空白要 555 秒才進第一條規則（pwsh 7 有自動原子化才
     # 沒事）。改成純分隔符；各消費端（刪除分類器、verb-anywhere、Get-WfCommandWord）本來就會 Trim。
     $segments = [regex]::Split($cmd, '(?:;|&&|\|\||\||&(?!&))')
+    # 2026-10-10（階段 1 審查 blocker）：刪除分類器的 ask **不再當場 return**，改存成 $pendingAsk，等下方
+    # denyPatterns（終止類／R1）與 verb-anywhere 都跑完、確定沒有 deny 才回傳。原寫法先回 ask，讓
+    # 「遞迴刪除某暫存目錄 ; 終止指令」或「遞迴刪除登記目錄本身」整串降成 ask——而 ask 在背景子 agent
+    # 內正是擋不住的那一級（spec §1）。第 601 行舊註解「denyPatterns 對整串比對故不受影響」描述的是
+    # 比對範圍，不是回傳順序；順序才是洞。deny 級分類維持當場 return。
+    $pendingAsk = $null
     foreach ($seg in $segments) {
         $cls = Get-DeleteClassification $seg
         if ($cls -eq 'deny') { return @{ decision = 'deny'; why = "遞迴刪除根目錄／家目錄／整個目前目錄（$($seg.Trim())）" } }
-        if ($cls -eq 'ask')  { return @{ decision = 'ask';  why = "遞迴刪除檔案／目錄（$($seg.Trim())）" } }
+        if ($cls -eq 'ask' -and $null -eq $pendingAsk) { $pendingAsk = @{ decision = 'ask';  why = "遞迴刪除檔案／目錄（$($seg.Trim())）" } }
         # 'allow'（安全目標）與 $null（非刪除）都繼續往下檢查其他樣式
     }
 
@@ -720,6 +726,38 @@ function Get-GuardVerdictSingle {
         # 線性。-F 那一支原本是 `-F\s+[^;&|]*@` 再接 C，拆成獨立一條。耗時由 test-guard-perf.ps1 釘住。
         @{ rx = '(?:^|[;&|])(?>[^;&|]*?(?:curl|wget|iwr|invoke-webrequest)\b)(?>[^;&|]*?(?:-T\s|--upload-file|-d\s*@|--data(?:-binary|-raw|-urlencode)?[= ]@))[^;&|]*(?:\.env|\.pem|\.key|id_rsa|id_ed25519|credentials|\.pfx|secrets?\.(?:json|ya?ml))'; why = '把機密檔（.env/私鑰/憑證）上傳到網路' },
         @{ rx = '(?:^|[;&|])(?>[^;&|]*?(?:curl|wget|iwr|invoke-webrequest)\b)(?>[^;&|]*?-F\s)(?>[^;&|]*?@)[^;&|]*(?:\.env|\.pem|\.key|id_rsa|id_ed25519|credentials|\.pfx|secrets?\.(?:json|ya?ml))'; why = '把機密檔（.env/私鑰/憑證）上傳到網路' },
+        # ──────────────────────────────────────────────────────
+        # 2026-10-10（spec .governance/specs/2026-10-10-termination-guard-redesign.md v0.3，使用者裁定）：
+        # 程序終止類**從 ask 改 deny，無豁免**。理由：2026-10-02 一手觀測——workflow 背景子 agent 的
+        # 終止指令被兩份 hook 回 ask 後 93 秒執行、逐字稿無核准紀錄；ask 在背景子 agent 內不是硬關卡。
+        # 使用者 10-02／10-10 裁定：終止類不靠確認框，擋下並在對話裡問。
+        # 「只是提到」（commit 訊息、grep、文件）不做解析式豁免（兩輪紅隊：豁免＝執行原語黑名單，漏一個
+        # 就放行、引號語意依殼不同），改道：Grep／Read 工具、`git commit -F 檔`、`add-guard-case -CommandFile`。
+        # 09-20 版本的三條 ask（終止動詞／WMI·CIM·.Kill()／-EncodedCommand）就是下面前三條，原文照搬。
+        # guard-bash 的 Deny 對這一類會印改道說明、不回顯指令原文，並做 D5 計數（同一 agent_id 第二次撞到就寫 taint）。
+        @{ rx = '(^|[\s;&|(){`"''/\\=:])(taskkill|tskill|pkill|killall|stop-process|spps)(\.exe)?(?![\w.-])'; why = '程序終止指令（2026-09-19 事故；2026-10-10 起 deny 無豁免）：只准用 with-child.mjs 收自己登記的 PID；按名稱／篩選／埠／迴圈／變數殺一律擋下，要動別的程序在對話裡問使用者' },
+        @{ rx = '(?:^|[;&|])(?>[^;&|]*?\bwmic(?:\.exe)?\b)(?>[^;&|]*?\b(?:win32_)?process\b)[^;&|]*\b(?:delete|call\s+terminate)\b|(?:^|[;&|])(?>[^;&|]*?\b(?:invoke-cimmethod|invoke-wmimethod)\b)[^;&|]*\bterminate\b|\.(kill|terminate|closemainwindow)\s*\('; why = '程序終止（WMI／CIM Terminate、.Kill()／.CloseMainWindow()；2026-10-10 起 deny）：只准用 with-child.mjs 收自己登記的 PID' },
+        # 旗標拼法（2026-10-10 本機實測 scratchpad probe-enc-prefix.ps1，pwsh 7 與 5.1 各 19 種）：encodedcommand 的**任何前綴**
+        # （-e／-en／-enco／…／-encodedcom）都會執行，`-ec` 是獨立別名，前綴可用 `-`、`/`、`--`（5.1 不吃 `--`）。
+        # 寫成明列前綴而不是 e[a-z]*，避免吃到 -ExecutionPolicy／-ep／-Encoding／-env。
+        # （同日第一版用巢狀可選群組，括號少一個 → .NET 拒絕編譯 → Test-GuardRx 的 fail-closed 把**每一條**指令判 deny；
+        #  被 test-core-cmd／parity／perf 正控制同時抓到。改寫成明列，並以 scratchpad validate-rx.ps1 逐條編譯驗過。）
+        @{ rx = '\b(powershell|pwsh)(\.exe)?\b[^;&|]*\s[-/]{1,2}(ec|e|en|enc|enco|encod|encode|encoded|encodedc|encodedco|encodedcom|encodedcomm|encodedcomma|encodedcomman|encodedcommand)\b'; why = '程序終止類同級：PowerShell -EncodedCommand（base64 指令，內容不可靜態判定；2026-10-10 起 deny，近 30 天 13 筆 ask 改走明碼或 -File）' },
+        # 裸 `kill`：只抓「kill 後接訊號／PID／具名參數的形狀」，不抓英文句子裡的 kill、`kill -l`、`kill -0`（只探測存活）、
+        # `kill %1`（job spec）、`docker|podman [container] kill`（容器非宿主程序）。2026-10-10 攻擊語料 variant-3：for 迴圈內 kill -9 $p 現況放行。
+        # 訊號名列舉而不用 -[A-Z]+：比對是不分大小寫的，泛寫會把 `kill -l` 也吃進去（攻擊案 term-v03-barekill-signame 抓到 -KILL 無 SIG 前綴漏掉）。
+        # 階段 1 審查（major）補：PowerShell 別名 kill＝Stop-Process 的 -Name／-Id／-ProcessName／-InputObject；bash 的 "$p"、${p}、$(pgrep …)、
+        # 反引號、`-n N`、`-s` 黏著訊號、`--` 後接 PID；管線末端或 xargs 末端只放 kill；`% Kill`／`ForEach-Object [-MemberName] Kill`。
+        @{ rx = '(^|[\s;&|(){`"''/\\=:])(?<!(docker|podman)(\s+container)?\s+)kill(\.exe)?\s+(-[1-9][0-9]*\b|-s\s*\S+|-n\s*[0-9]+\b|--\s+\S|-(SIG)?(KILL|TERM|HUP|INT|QUIT|STOP|CONT|USR1|USR2|ABRT|SEGV|ALRM|PIPE)\b|-(name|id|processname|inputobject)\b|["'']?\$[\w{(]|`|[0-9]+\b)|(\|\s*|\bxargs\s+(-\S+\s+)*)kill(\.exe)?\s*($|[;&|)])|(^|[\s;&|(){])(%|foreach-object)\s+(-membername\s+)?kill\b'; why = '程序終止指令（裸 kill／PowerShell kill 別名接訊號／PID／具名參數／管線；2026-10-10 起 deny）：只准用 with-child.mjs 收自己登記的 PID' },
+        # R1：with-child 登記目錄＋寫入動詞同時出現 → deny（偽造登記；2026-10-10 攻擊語料 registry-1～6 現況零規則全放行）。
+        # 階段 1 審查（major／minor）後的形狀：①兩個目錄字面 session-state 與 with-child **各自**出現即可（擋 cd 進 session-state 再對
+        # with-child/ 相對路徑寫入）；②寫入動詞集合與 Test-WfDirWriteWhole 的 verbRx 對齊再加刪除／改名／sed -i／writeFileSync；
+        # ③重導向排除 stderr 丟棄形狀（2>&1、2>$null、>/dev/null、>nul），唯讀列目錄帶 2>&1 不再被當寫入（minor-4）。
+        # 殘餘（明文）：直譯器執行期組路徑寫檔、萬用字元／變數拼出目錄名、8.3 短名——字面比對層看不到，與 webfetch 目錄規則 F3 同一邊界。
+        @{ rx = '^(?=[\s\S]*\bsession-state\b)(?=[\s\S]*\bwith-child\b)(?=[\s\S]*((?<![0-9])>>?(?!\s*["'']?(\$null|/dev/null|nul\b|&[0-9]))|\b(set-content|sc|out-file|add-content|ac|new-item|ni|copy-item|cpi|copy|cp|move-item|mi|mv|move|rename-item|rni|ren|rename|clear-content|clc|set-itemproperty|mklink|tee|tee-object|touch|robocopy|xcopy|rm|del|erase|remove-item|ri|rmdir|rd|unlink|truncate|install)\b|\bsed\s+-[a-z]*i|\[(system\.)?io\.file\]::\w+|\b(writefile|appendfile|copyfile|renamefile|createwritestream|unlink|rename|rm)(sync)?\s*\(|\bopen\s*\(|\.lastwritetime(utc)?\s*=))'; why = '寫入 with-child 登記目錄（偽造／竄改程序登記；2026-10-10 起 deny）：登記只能由 with-child run 或使用者親手 adopt 建立' },
+        # R1b（階段 1 審查 major-3）：with-child.mjs 接受 %TEMP% 底下任何 WITH_CHILD_DIR（測試注入用），而 %TEMP% 是 agent 可寫的——
+        # 在殼層設定這個變數再 stop，等於自備一個不受 R1 字面保護的登記目錄。agent 殼裡沒有合法理由設定它（測試套件在行程內設、不經指令行）。
+        @{ rx = '\bWITH_CHILD_DIR\s*=|\$env:WITH_CHILD_DIR\s*=|setenvironmentvariable\s*\([^)]*WITH_CHILD_DIR|\b(set|setx|export|env)\s+WITH_CHILD_DIR\b'; why = '設定 WITH_CHILD_DIR（自備 with-child 登記目錄＝繞過 R1 登記保護；2026-10-10 起 deny）：登記目錄固定在 session-state/with-child，測試注入只准在測試行程內' }
         # 2026-10-10（D8 審查 finding：--cross-session 與冒名環境變數沒有機械閘門）：with-child.mjs stop 只終止
         # 「本 session 登記」的程序，跨 session 要 --cross-session；呼叫者身分來自 CLAUDE_CODE_SESSION_ID。
         # 若 agent 被拒一次後能自己加旗標、或設／清環境變數冒名重試，整道 session 比對形同虛設且全程不經過使用者。
@@ -749,6 +787,9 @@ function Get-GuardVerdictSingle {
             return @{ decision = 'ask'; why = "cmd 刪除家族含 /s 遞迴、動詞非段首（目標經迴圈/展開靜態不可判定）（$st）" }
         }
     }
+
+    # 刪除分類器暫存的 ask 在此回傳（所有 deny 規則都已跑完；見上方 $pendingAsk 說明）
+    if ($null -ne $pendingAsk) { return $pendingAsk }
 
     # ──────────────────────────────────────────────────────
     # 4) ASK 樣式：使用者「先問」清單 → 強制確認框
@@ -867,26 +908,17 @@ function Get-GuardVerdictSingle {
         @{ rx = '(curl|wget|iwr|invoke-webrequest|downloadstring)\b[^;&|]*\|\s*(iex|invoke-expression)\b'; why = '下載內容直接 Invoke-Expression（供應鏈風險）' },
         # A2b 延伸（2026-07-11）：解碼器/產生器管道餵 shell（混淆執行）→ ASK
         @{ rx = '(base64\s+-d|base64\s+--decode|xxd\s+-r|printf\b)[^;&|]*\|\s*(ba|z|da)?sh\b'; why = 'base64/printf 等解碼產生後直接餵 shell 執行（混淆式供應鏈風險）' },
-        # 2026-07-25：PowerShell -EncodedCommand（base64 payload）——內容靜態不可判定，
-        # 展開層也看不進去（實測 V1/V2 皆放行）。不解碼、只看旗標，一律 ask。
-        # 取捨：合法的編碼呼叫也會被問一次；相對於「任意指令零攔截」這是划算的。
-        @{ rx = '\b(powershell|pwsh)(\.exe)?\b[^;&|]*\s-(e|ec|enc|encoded|encodedcommand)\b'; why = 'PowerShell -EncodedCommand（base64 指令，內容不可靜態判定）' },
+        # 2026-07-25：PowerShell -EncodedCommand（base64 payload）——內容靜態不可判定，展開層也看不進去。
+        # 2026-10-10 起移到 denyPatterns（終止類同級，見該段註解）；此處不再重複。
         # 2026-07-31（settings.local 破口同批）：--settings 指定外部設定檔＝第四種設定載體，
         # 可載入未受 guard-write 保護、未進版控的 permissions/hooks/env。與 protectRx 三載體同壘。
         @{ rx = '\bclaude(\.exe|\.cmd)?\b[^;&|]*\s--settings\b'; why = 'claude --settings 指定外部設定檔（繞過版控 settings 的第四種載體，先確認來源）' },
         # 2026-09-20（09-19 taskkill //IM 事故後的最小備援；完整評估見 research-decisions/2026-09-20-taskkill-incident-prevention.md）：
-        # 程序終止動詞**出現在指令任何位置**就 ask。主防線是 settings 的 permissions.deny（整條 taskkill／Stop-Process -Name／pkill／killall），
-        # 但實測 settings 規則有兩個洞：Bash 規則分大小寫（`Taskkill` 放行）、帶迴圈變數的 for 迴圈本體不被分析
-        # （`for p in $(tasklist…); do taskkill /F /PID $p; done` 放行＝事故第二條的原形）。本規則用 -imatch 對整串比對，
-        # 迴圈／變數／殼包裹／全路徑／大小寫都看得到。刻意用 ask 不用 deny：commit 訊息或 grep 提到這些字也會被問一次，
-        # 但那是低頻且可放行的；deny 會連治理工作本身一起鎖死（紅隊實測 14 條）。合法收尾路徑＝ .governance/bin/with-child.mjs。
-        # 不抓裸 `kill`（bash builtin 的 kill %1／PowerShell 別名太常見於無害脈絡）；PowerShell 別名 spps 抓。
-        # 2026-10-03（setx-fix）：前綴字元類補 `{`（`& {taskkill ...}` 腳本區塊）與 `:`
-        # （`-FilePath:taskkill` 這類冒號綁定），與下方 setx 規則同一個洞一併補。
-        @{ rx = '(^|[\s;&|(){`"''/\\=:])(taskkill|tskill|pkill|killall|stop-process|spps)(\.exe)?(?![\w.-])'; why = '程序終止指令（2026-09-19 事故）：只准用 with-child.mjs 收自己登記的 PID；按名稱／篩選／埠／迴圈／變數殺一律先問' },
-        # 2026-10-07：前兩支改成片段起點＋原子群組取第一次出現（wmic 那支原寫法立方級，16 KB 超過 150 秒）。
-        # 2026-10-08（審查 A2-5）：補 `wmic path win32_process … call terminate`（win32_ 底線後的 process 沒有詞界，新舊版都漏）。
-        @{ rx = '(?:^|[;&|])(?>[^;&|]*?\bwmic(?:\.exe)?\b)(?>[^;&|]*?\b(?:win32_)?process\b)[^;&|]*\b(?:delete|call\s+terminate)\b|(?:^|[;&|])(?>[^;&|]*?\b(?:invoke-cimmethod|invoke-wmimethod)\b)[^;&|]*\bterminate\b|\.(kill|terminate|closemainwindow)\s*\('; why = '程序終止（WMI／CIM Terminate、.Kill()／.CloseMainWindow()）：只准用 with-child.mjs 收自己登記的 PID' },
+        # 程序終止動詞**出現在指令任何位置**就攔。主防線是 settings 的 permissions.deny，但實測有兩個洞：Bash 規則分大小寫、
+        # 帶迴圈變數的 for 本體不被分析。本規則對整串比對，迴圈／變數／殼包裹／全路徑／大小寫都看得到。
+        # 09-20 版用 ask（怕鎖死提到這些字的治理工作，紅隊實測 14 條）；**2026-10-10 起兩條終止規則移到 denyPatterns**
+        # （ask 在背景子 agent 內不是硬關卡的一手證據見 spec v0.3 §1；「提到」改道而非豁免）。此處不再重複。
+        # 2026-10-03（setx-fix）前綴字元類補 `{` 與 `:`、2026-10-07 wmic 改原子群組、2026-10-08 補 win32_process 的註記隨規則一併搬到 deny 段。
         # 2026-10-03（setx-guard 補丁；規格權威見 .governance/specs/2026-10-03-persistent-env-guard.md）：
         # 持久環境變數／登錄檔 Environment 鍵寫入——與程序終止同級（AGENTS.md「機器狀態」規則，
         # 2026-09-19 事故後）：不得改永久環境變數、登錄檔。裁量權在使用者，故用 ask 不用 deny。
@@ -985,7 +1017,7 @@ function Get-GuardVerdictSingle {
 #
 #   實測（127 案例 + 16 條日常指令）：只影響 7 條殼包裹攻擊案例（全為 ask→deny 加嚴），
 #   日常合法指令 0 條被加嚴（`bash -c "rm -rf ./dist"` 等安全目標仍走內層 classifier 判 ask）。
-#   已知殘留：base64 `-EncodedCommand`（改由上方 askPatterns 一律 ask 兜底）、
+#   已知殘留：base64 `-EncodedCommand`（改由上方 denyPatterns 一律 deny 兜底，2026-10-10；原為 askPatterns ask）、
 #   變數間接（`$r=rm;$r -rf /`）——展開層看不進去，仍是殘留。
 # ──────────────────────────────────────────────────────────────
 function Expand-ShellWrapper {
