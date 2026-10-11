@@ -144,6 +144,12 @@ workflow）時，證據必須是**用那個確切呼叫方式端到端跑過一�
   `tasklist`／`Get-Process` 後迴圈或管線終止、`.Kill()`／`Terminate()`／`CloseMainWindow()`；
   **沒列到的形式不代表允許**。「看起來像自己的」不算自己的。）收尾只走
   `node .governance/bin/with-child.mjs run|stop`；測試用瀏覽器一律帶專屬 `--user-data-dir`。
+  **終止類指令在指令行一律被守門 deny、無豁免**（2026-10-10 使用者裁定）：只是要**提到**這些字（commit 訊息、
+  搜尋、文件、加守門語料）改走 Grep／Read 工具或先寫進檔案再 `git commit -F`／`-CommandFile`／`-File`；
+  真要動不是自己起的程序，**在對話裡向使用者說明**（程序、PID、StartTime、理由）並等文字回覆，**不得改寫指令再試**
+  （同一 agent 第二次撞到即寫 taint）；子 agent 遇到就停止該項工作、回傳 `needs_user_machine_action` 交主迴圈問。
+  守門是字面比對，執行期才組出的指令它看不到——**看不到不代表允許**，這條規則照樣適用。
+  `with-child stop` 只限本 session 登記的程序；遇 exit 6 就停手在對話裡回報，跨 session 由使用者親手執行。
 
 **一次授權不等於永久授權**：換情境要重新確認。
 
@@ -167,7 +173,7 @@ workflow）時，證據必須是**用那個確切呼叫方式端到端跑過一�
 ## 多 agent 並行的鐵則：序列交接
 
 **同一個 repo 在同一時間只能有一個 agent 在動。** 併發寫入同一棵工作樹會造成後寫覆蓋
-先寫、branch checkout 互斷、git index 損毀。交接順序：前一個 agent 跑驗證 → 更新交接卡 →
+先寫、branch checkout 互斷、git 指令彼此 fail-fast 卡住。交接順序：前一個 agent 跑驗證 → 更新交接卡 →
 commit → 確認 `git status --short` 乾淨 → 下一個 agent 才開始（第一步是讀交接卡）。
 
 真要並行才用獨立 git worktree ＋ 獨立分支，但那有成本（`.env`／`node_modules` 不跟過去、
