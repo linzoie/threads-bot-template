@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 # ============================================================
 # antigravity-guard.ps1 — Antigravity PreToolUse 守門（run_command）
 #                         Antigravity adapter（薄 shim over guard-core.ps1）
@@ -80,7 +80,11 @@ function ForceAsk([string]$reason) {
     Write-Output (@{ decision = 'force_ask'; reason = $reason } | ConvertTo-Json -Compress)
     exit 0
 }
-function Allow { Write-Output '{}'; exit 0 }
+function Allow {
+    Write-HookLog "DECISION=allow: 放行"
+    Write-Output (@{ decision = 'allow' } | ConvertTo-Json -Compress)
+    exit 0
+}
 
 # ──────────────────────────────────────────────────────────────
 # 輸入層：契約解析失敗＝**fail-visible，不是 fail-open**（2026-07-26 紅隊打穿後改）
