@@ -104,7 +104,7 @@ if (-not $raw) {
     ForceAsk '⚠️ antigravity-guard 收到空的 stdin —— 無法取得指令內容，本次未經安全判定。這通常代表 hook 契約已漂移，請檢查 .agents/hooks.json 與 Antigravity 版本'
 }
 # BOM 剝除：Windows 上 .NET 寫出的 UTF-8 常帶 BOM，ConvertFrom-Json 會因此 parse 失敗
-$raw = $raw -replace "^﻿", ''
+$raw = $raw -replace '^\uFEFF', ''
 Write-HookLog "CALLED stdin=$($raw.Length)bytes"
 
 try { $data = $raw | ConvertFrom-Json } catch {

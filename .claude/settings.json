@@ -68,6 +68,15 @@
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-dispatch-taint.ps1\""
           }
         ]
+      },
+      {
+        "matcher": "^Monitor$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-monitor-loop.ps1\""
+          }
+        ]
       }
     ],
     "PostToolUse": [
