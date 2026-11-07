@@ -98,7 +98,29 @@ function Allow {
 # ——這支每次 run_command 都跑，deny 會鎖死 agent；force_ask 停得下來又留得下人工放行的路，
 # 且忽略「Always Allow」快取、不會被一次點擊靜默白名單。
 # ──────────────────────────────────────────────────────────────
-$raw = [Console]::In.ReadToEnd()
+# stdin is read as raw bytes and decoded as UTF-8. [Console]::In decodes with the console input
+# code page (950 on zh-TW), which corrupts non-ASCII text and eats backslashes (Bad JSON escape).
+# The byte read happens only when stdin is redirected (the real hook case: Claude Code pipes it). When stdin
+# is the interactive console, OpenStandardInput().CopyTo() waits for keyboard EOF forever, so it is skipped.
+# Console.In is the fallback when stdin is not redirected, the byte read fails, or it yields nothing
+# (this also serves in-process callers that inject stdin via [Console]::SetIn, e.g. test-adapter-parity).
+function Read-StdinUtf8 {
+    $b = $null
+    if ([Console]::IsInputRedirected) {
+        try {
+            $ms = New-Object System.IO.MemoryStream
+            [Console]::OpenStandardInput().CopyTo($ms)
+            $b = $ms.ToArray()
+        } catch { $b = $null }
+    }
+    if ($null -ne $b -and $b.Length -gt 0) {
+        $start = 0
+        if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
+        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+    }
+    try { return [Console]::In.ReadToEnd() } catch { return '' }
+}
+$raw = Read-StdinUtf8
 if (-not $raw) {
     Write-HookLog 'CALLED but stdin EMPTY'
     ForceAsk '⚠️ antigravity-guard 收到空的 stdin —— 無法取得指令內容，本次未經安全判定。這通常代表 hook 契約已漂移，請檢查 .agents/hooks.json 與 Antigravity 版本'

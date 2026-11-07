@@ -34,7 +34,29 @@
 $ErrorActionPreference = 'Continue'
 
 # 0) 防迴圈：stop_hook_active 表示本 hook 已經擋過一次，這次放行
-$raw = [Console]::In.ReadToEnd()
+# stdin is read as raw bytes and decoded as UTF-8. [Console]::In decodes with the console input
+# code page (950 on zh-TW), which corrupts non-ASCII text and eats backslashes (Bad JSON escape).
+# The byte read happens only when stdin is redirected (the real hook case: Claude Code pipes it). When stdin
+# is the interactive console, OpenStandardInput().CopyTo() waits for keyboard EOF forever, so it is skipped.
+# Console.In is the fallback when stdin is not redirected, the byte read fails, or it yields nothing
+# (this also serves in-process callers that inject stdin via [Console]::SetIn, e.g. test-adapter-parity).
+function Read-StdinUtf8 {
+    $b = $null
+    if ([Console]::IsInputRedirected) {
+        try {
+            $ms = New-Object System.IO.MemoryStream
+            [Console]::OpenStandardInput().CopyTo($ms)
+            $b = $ms.ToArray()
+        } catch { $b = $null }
+    }
+    if ($null -ne $b -and $b.Length -gt 0) {
+        $start = 0
+        if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
+        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+    }
+    try { return [Console]::In.ReadToEnd() } catch { return '' }
+}
+$raw = Read-StdinUtf8
 if ($raw) {
     try {
         $hookData = $raw | ConvertFrom-Json
