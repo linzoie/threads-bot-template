@@ -58,7 +58,16 @@ if ($env:AGY_HOOK_LOG_DIR -and -not (Test-Path $logDir)) {
     try { New-Item -ItemType Directory -Path $logDir -Force | Out-Null } catch {}
 }
 $logPath = Join-Path $logDir 'hook-calls.log'
+# 2026-11-09（F2，乙組總審 #8 S1）：理由與日誌不得回顯金鑰。核心的 Get-GuardVerdict 已遮罩 why；這裡是第二道，
+# 守住不經核心的出口（Deny／ForceAsk 的 reason、hook-calls.log 的 DECISION 行）。核心沒載入時（降級路徑）reason 是固定文字，原樣放行。
+# 殘餘：核心載入前寫的 PARSED／DEGRADED-ASK 兩行仍記指令原文，只受下方 F5 的舊式遮罩（見 openIssues）。
+function AgfxMaskText([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return $s }
+    try { if (Get-Command Protect-GuardSecrets -ErrorAction SilentlyContinue) { return (Protect-GuardSecrets $s) } } catch { }
+    return $s
+}
 function Write-HookLog([string]$m) {
+    $m = AgfxMaskText $m
     # 遮罩（2026-07-26 紅隊 F5）：本 log 逐字記錄完整指令列，指令內嵌的 token／金鑰會落地成
     # 明文。.agents/.gitignore 已排除 *.log（實測 sync 會散佈該 .gitignore），所以不會進版控，
     # 但本機明文仍是殘餘。遮常見的憑證形狀；遮罩失敗不得影響記錄本身（全程 best-effort）。
@@ -71,18 +80,20 @@ function Write-HookLog([string]$m) {
     try { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content -Path $logPath -Encoding utf8 } catch {}
 }
 function Deny([string]$reason) {
+    $reason = AgfxMaskText $reason
     Write-HookLog "DECISION=deny: $reason"
-    Write-Output (@{ decision = 'deny'; reason = $reason } | ConvertTo-Json -Compress)
+    Write-Output (ConvertTo-AsciiJsonText (@{ decision = 'deny'; reason = $reason } | ConvertTo-Json -Compress))
     exit 0
 }
 function ForceAsk([string]$reason) {
+    $reason = AgfxMaskText $reason
     Write-HookLog "DECISION=force_ask: $reason"
-    Write-Output (@{ decision = 'force_ask'; reason = $reason } | ConvertTo-Json -Compress)
+    Write-Output (ConvertTo-AsciiJsonText (@{ decision = 'force_ask'; reason = $reason } | ConvertTo-Json -Compress))
     exit 0
 }
 function Allow {
     Write-HookLog "DECISION=allow: 放行"
-    Write-Output (@{ decision = 'allow' } | ConvertTo-Json -Compress)
+    Write-Output (ConvertTo-AsciiJsonText (@{ decision = 'allow' } | ConvertTo-Json -Compress))
     exit 0
 }
 
@@ -116,9 +127,28 @@ function Read-StdinUtf8 {
     if ($null -ne $b -and $b.Length -gt 0) {
         $start = 0
         if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
-        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start).TrimStart([char]0xFEFF)
     }
     try { return [Console]::In.ReadToEnd() } catch { return '' }
+}
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
+# The decision JSON is pure ASCII: every char above 126 becomes a backslash-u escape (no dependence on the console encoding).
+function ConvertTo-AsciiJsonText([string]$j) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $j.ToCharArray()) {
+        if ([int]$ch -gt 126) { [void]$sb.Append([char]92).Append('u').Append(([int]$ch).ToString('x4')) }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
 }
 $raw = Read-StdinUtf8
 if (-not $raw) {
@@ -126,7 +156,7 @@ if (-not $raw) {
     ForceAsk '⚠️ antigravity-guard 收到空的 stdin —— 無法取得指令內容，本次未經安全判定。這通常代表 hook 契約已漂移，請檢查 .agents/hooks.json 與 Antigravity 版本'
 }
 # BOM 剝除：Windows 上 .NET 寫出的 UTF-8 常帶 BOM，ConvertFrom-Json 會因此 parse 失敗
-$raw = $raw -replace '^\uFEFF', ''
+$raw = $raw -replace '^\uFEFF+', ''
 Write-HookLog "CALLED stdin=$($raw.Length)bytes"
 
 try { $data = $raw | ConvertFrom-Json } catch {
@@ -226,7 +256,11 @@ $verdict = Get-GuardVerdict -Command $cmd
 if ($null -eq $verdict -or -not $verdict.decision) { Invoke-Degraded 'guard-core 回傳無效判定（null 或缺 decision 欄位）' }
 
 switch ($verdict.decision) {
-    'deny'  { Deny "antigravity-guard：$($verdict.why)。此類指令一律由使用者本人於終端機執行" }
+    'deny'  {
+        # 乙組 #5（S2）：互動直譯器類的 why 自帶改道做法，不再接「一律由使用者本人執行」（兩句互相矛盾）。
+        if ("$($verdict.why)" -match '^(?:互動直譯器啟動|以偵錯埠啟動瀏覽器)') { Deny "antigravity-guard：$($verdict.why)" }
+        else { Deny "antigravity-guard：$($verdict.why)。此類指令一律由使用者本人於終端機執行" }
+    }
     'ask'   { ForceAsk "使用者硬規則「破壞性／難復原動作一律先問」：$($verdict.why)。請確認後再放行" }
     'pass'  { Write-HookLog 'DECISION=(none) 放行'; Allow }
     default { Invoke-Degraded "guard-core 回傳未知判定值 '$($verdict.decision)'" }

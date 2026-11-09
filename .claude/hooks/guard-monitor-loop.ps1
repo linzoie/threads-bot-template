@@ -63,8 +63,19 @@ function Read-StdinUtf8 {
     $b = $ms.ToArray()
     $start = 0
     if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
-    return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+    return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start).TrimStart([char]0xFEFF)
 }
+
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
 
 function ConvertTo-AsciiJson($obj) {
     $j = $obj | ConvertTo-Json -Depth 6 -Compress

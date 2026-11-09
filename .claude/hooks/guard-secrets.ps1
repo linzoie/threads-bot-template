@@ -37,13 +37,38 @@ function Read-StdinUtf8 {
     if ($null -ne $b -and $b.Length -gt 0) {
         $start = 0
         if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
-        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start).TrimStart([char]0xFEFF)
     }
     try { return [Console]::In.ReadToEnd() } catch { return '' }
 }
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
+# JSON handed to Claude Code is pure ASCII: every char above 126 becomes a backslash-u escape (no dependence on the console encoding).
+function ConvertTo-AsciiJsonText([string]$j) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $j.ToCharArray()) {
+        if ([int]$ch -gt 126) { [void]$sb.Append([char]92).Append('u').Append(([int]$ch).ToString('x4')) }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+# Input that is non-empty but not valid JSON means this guard cannot judge the call: ask (fail-visible), do not let it through.
+function Write-ParseFailureAsk([string]$hookName) {
+    $reason = "$hookName could not parse its input (non-empty, not valid JSON), so this tool call was NOT judged by it. Check the call yourself before allowing it."
+    $o = [ordered]@{ hookSpecificOutput = [ordered]@{ hookEventName = 'PreToolUse'; permissionDecision = 'ask'; permissionDecisionReason = $reason } }
+    [Console]::Out.WriteLine((ConvertTo-AsciiJsonText ($o | ConvertTo-Json -Depth 5 -Compress)))
+}
 $raw = Read-StdinUtf8
 if (-not $raw) { exit 0 }
-try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
+try { $data = $raw | ConvertFrom-Json } catch { if ($raw.Trim()) { Write-ParseFailureAsk 'guard-secrets' }; exit 0 }
 
 $cmd = $data.tool_input.command
 if (-not $cmd) { exit 0 }

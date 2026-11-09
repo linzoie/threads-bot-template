@@ -119,10 +119,29 @@ function Read-StdinUtf8 {
         $sin = [Console]::OpenStandardInput()
         if ($null -eq $sin) { return '' }
         $sr = New-Object System.IO.StreamReader($sin, (New-Object System.Text.UTF8Encoding $false))
-        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+        try { return $sr.ReadToEnd().TrimStart([char]0xFEFF) } finally { $sr.Dispose() }
     } catch {
         try { return [Console]::In.ReadToEnd() } catch { return '' }
     }
+}
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
+# JSON handed to Claude Code is pure ASCII: every char above 126 becomes a backslash-u escape (no dependence on the console encoding).
+function ConvertTo-AsciiJsonText([string]$j) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $j.ToCharArray()) {
+        if ([int]$ch -gt 126) { [void]$sb.Append([char]92).Append('u').Append(([int]$ch).ToString('x4')) }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
 }
 
 function Get-SafeSessionKey([string]$sid) {
@@ -146,7 +165,7 @@ function Ask([string]$why) {
             permissionDecisionReason = $why
         }
     } | ConvertTo-Json -Depth 5 -Compress
-    [Console]::Out.WriteLine($out)
+    [Console]::Out.WriteLine((ConvertTo-AsciiJsonText $out))
     exit 0
 }
 

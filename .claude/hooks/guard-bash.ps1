@@ -15,7 +15,8 @@
 #   - ask ：permissionDecision "ask"（使用者「破壞性／難復原一律先問」清單）
 #   - pass：exit 0
 #
-# stdin 解析失敗一律 fail-open（exit 0）——沒有指令可判，不是防護失效。
+# stdin 空＝exit 0（沒有指令可判）。stdin 非空卻解析失敗＝fail-visible ASK（2026-11-08，乙組 #5：碼頁 950／雙 BOM
+# 曾讓 5 支守門在此靜默放行一切；取不到輸入≠沒有東西要判）。輸出一律 UTF-8 位元組、JSON 純 ASCII 跳脫（見 Initialize-HookUtf8Output）。
 #
 # **core 載入失敗＝fail-visible ASK，不是 fail-open**（2026-07-26 紅隊實測後改）：
 #   舊版只用 `Test-Path` 判斷 core 在不在，而且 $ErrorActionPreference='SilentlyContinue'
@@ -47,13 +48,38 @@ function Read-StdinUtf8 {
     if ($null -ne $b -and $b.Length -gt 0) {
         $start = 0
         if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
-        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start).TrimStart([char]0xFEFF)
     }
     try { return [Console]::In.ReadToEnd() } catch { return '' }
 }
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
+# JSON handed to Claude Code is pure ASCII: every char above 126 becomes a backslash-u escape (no dependence on the console encoding).
+function ConvertTo-AsciiJsonText([string]$j) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $j.ToCharArray()) {
+        if ([int]$ch -gt 126) { [void]$sb.Append([char]92).Append('u').Append(([int]$ch).ToString('x4')) }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+# Input that is non-empty but not valid JSON means this guard cannot judge the call: ask (fail-visible), do not let it through.
+function Write-ParseFailureAsk([string]$hookName) {
+    $reason = "$hookName could not parse its input (non-empty, not valid JSON), so this tool call was NOT judged by it. Check the call yourself before allowing it."
+    $o = [ordered]@{ hookSpecificOutput = [ordered]@{ hookEventName = 'PreToolUse'; permissionDecision = 'ask'; permissionDecisionReason = $reason } }
+    [Console]::Out.WriteLine((ConvertTo-AsciiJsonText ($o | ConvertTo-Json -Depth 5 -Compress)))
+}
 $raw = Read-StdinUtf8
 if (-not $raw) { exit 0 }
-try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
+try { $data = $raw | ConvertFrom-Json } catch { if ($raw.Trim()) { Write-ParseFailureAsk 'guard-bash' }; exit 0 }
 
 $cmd = $data.tool_input.command
 if (-not $cmd) { exit 0 }
@@ -81,7 +107,21 @@ function Test-NoReparseUnderTemp([string]$full, [string]$tmpRoot) {
 
 # outcome 觀測（2026-07-11）：把每次 deny/ask 記一行到 ~/.claude/governance-logs（月檔）。
 # 全程 fail-open——記 log 失敗絕不影響決策。是 outcome 觀測不是安全邊界。
+# 2026-11-09（F2，乙組總審 #8 S1）：理由與日誌不得回顯金鑰。判定核心已在 Get-GuardVerdict 出口遮罩 why；這裡是第二道，
+# 守住「不經核心的出口」：Write-GovLog／Deny／Ask 各自再遮一次（遮過的字串再遮是冪等的），以及 Deny 往 stderr 印的指令原文。
+# 核心還沒載入（FailVisible 路徑）時 why 是固定文字、不含指令，原樣放行；指令原文回顯則在遮罩函式不可用時整段略去。
+function AgfxMaskText([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return $s }
+    try { if (Get-Command Protect-GuardSecrets -ErrorAction SilentlyContinue) { return (Protect-GuardSecrets $s) } } catch { }
+    return $s
+}
+function AgfxMaskCmd([string]$s) {
+    try { if (Get-Command Protect-GuardSecrets -ErrorAction SilentlyContinue) { return (Protect-GuardSecrets $s) } } catch { }
+    return '（遮罩函式不可用，指令原文略去）'
+}
+
 function Write-GovLog([string]$hook, [string]$decision, [string]$why) {
+    $why = AgfxMaskText $why
     try {
         # 2026-07-31：env 重導向限 TEMP（settings 的 env 區塊是隱性不可信輸入，防守門 log 被導走）；2026-09-22 補 junction 解析
         $dir = Join-Path $HOME '.claude\governance-logs'
@@ -154,6 +194,7 @@ function Write-TerminationDenyCount([string]$why) {
 }
 
 function Deny([string]$why) {
+    $why = AgfxMaskText $why
     Write-GovLog 'guard-bash' 'deny' $why
     [Console]::Error.WriteLine("[BLOCKED] guard 攔截危險指令：$why")
     if ($why -match '程序終止|with-child 登記目錄|WITH_CHILD_DIR') {
@@ -169,8 +210,18 @@ function Deny([string]$why) {
             [Console]::Error.WriteLine("  真的要終止程序：唯一合法路徑是 node .governance/bin/with-child.mjs stop <pid>（只對本 session 登記過的 PID）。要動不是你起的程序：在對話裡向使用者說明（程序名、PID、StartTime、理由、不動會怎樣）並等文字回覆；子 agent 則停止該項工作並回傳 needs_user_machine_action 欄位。不要改寫指令繞過本規則。")
         }
         Write-TerminationDenyCount $why
+    } elseif ($why -match '^以偵錯埠啟動瀏覽器') {
+        # 偵錯埠守門（規格 2026-11-08-remote-debugging-guard.md §2）：不回顯指令原文（memory safety-classifier-cuts-payload-echo），
+        # 不計 D5（why 不含終止類關鍵字）；why 自帶改道做法，不接「一律由使用者手動執行」。
+        [Console]::Error.WriteLine("  （此類指令原文不回顯；長度 $($cmd.Length) 字元）")
+        [Console]::Error.WriteLine("  這一類不需要使用者代跑：照上面理由裡的改道做法改寫（Chrome CLI --screenshot 不開偵錯埠；只是提到這些字就改用 Grep／Read 工具或 git commit -F 檔案）。")
+    } elseif ($why -match '^互動直譯器啟動') {
+        # 乙組 #5（S2）：互動直譯器類的 why 自帶「改道」做法（--version／-c／先 Write 腳本／非空 heredoc），
+        # 不能再接「一律由使用者手動執行」——兩句互相矛盾，代理會停手而不是改寫指令。
+        [Console]::Error.WriteLine("  指令內容：$(AgfxMaskCmd $cmd)")
+        [Console]::Error.WriteLine("  這一類不需要使用者代跑：照上面理由裡的改道做法改寫指令（探測版本用 --version；執行程式用 -c 或先 Write 腳本檔；要餵資料用非空 heredoc 或管線）後再執行。")
     } else {
-        [Console]::Error.WriteLine("  指令內容：$cmd")
+        [Console]::Error.WriteLine("  指令內容：$(AgfxMaskCmd $cmd)")
         [Console]::Error.WriteLine("  此類指令一律由使用者本人於終端機手動執行，不由 Claude 代行。")
     }
     exit 2
@@ -207,6 +258,7 @@ function Get-AskFloodPrefix {
 }
 
 function Ask([string]$why) {
+    $why = AgfxMaskText $why
     Write-GovLog 'guard-bash' 'ask' $why
     $reason = (Get-AskFloodPrefix) + "使用者硬規則「破壞性／難復原動作一律先問」：$why。請確認後再放行。"
     $out = @{
@@ -216,7 +268,7 @@ function Ask([string]$why) {
             permissionDecisionReason = $reason
         }
     } | ConvertTo-Json -Depth 5 -Compress
-    [Console]::Out.WriteLine($out)
+    [Console]::Out.WriteLine((ConvertTo-AsciiJsonText $out))
     exit 0
 }
 
@@ -245,16 +297,57 @@ if ($null -eq $verdict -or -not $verdict.decision) { FailVisible 'guard-core 回
 #     也省掉不必要的 git 呼叫（Test-IsTreeMutatingGit 是純字串比對，微秒級；
 #     真正有成本的 git rev-parse 只在它命中時才跑）。
 #     **全程 fail-open**：Get-BranchDriftVerdict 內部任何一步取不到都回 pass。
+#     2026-11-08（F1）：drift 的 ask 先記在 $preAskWhy、不立刻 Ask——下面 4c 的整機程序列舉 deny 要能蓋過它（見 4c）。
+$preAskWhy = ''
 if ($verdict.decision -eq 'pass' -and
     (Get-Command Test-IsTreeMutatingGit -ErrorAction SilentlyContinue) -and
     (Test-IsTreeMutatingGit -Command $cmd)) {
     $drift = Get-BranchDriftVerdict -Command $cmd
-    if ($null -ne $drift -and $drift.decision -eq 'ask') { Ask $drift.why }
+    if ($null -ne $drift -and $drift.decision -eq 'ask') { $preAskWhy = "$($drift.why)" }
 }
+
+# 4c) 整機程序列舉卡住守門（2026-11-08，乙組 #10；F1 負載合併：原本是獨立 hook guard-process-query-stall，
+#     每次 Bash／PowerShell 呼叫多起一支 pwsh，現在函式庫由這裡呼叫，判定邏輯一份在 lib-process-query-stall.ps1）。
+#     優先序（與合併前兩支 hook 並行時一致）：core 的 deny（exit 2）最優先、不進這一段；本層的 deny 蓋過 core／drift 的 ask
+#     （deny 勝過 ask）；本層的 ask 只在 core 與 drift 都放行時才輸出；core／drift 自己的 ask 照舊走 Ask。
+#     **全程 fail-open**：函式庫缺檔或載入失敗＝本層略過並在 GovLog 記 procq-lib-unavailable（可見的 fail-open，不是 core 那種
+#     fail-visible ask：本層是減負載的提醒層，不是安全邊界，壞掉不能擋住診斷）。輸出是一行 ASCII JSON、離開碼 0（同合併前）。
+#     F1-M1（總審必修）：全域 ~/.claude/hooks 的副本不做本層——程序列舉守門與記錄原本只接在專案 settings（code/ 與子專案），
+#     記錄端若在全域與專案兩份各跑一次會把同一次逾時記兩次（record-branch-switch.ps1 的 B 段同一判斷）；守門端跟著只在專案副本做，
+#     兩端範圍一致、不擴到所有目錄。順帶：全域副本不載入函式庫，也就不會因函式庫缺檔而每次呼叫都寫一行 procq-lib-unavailable。
+#     下面這個函式與 record-branch-switch.ps1 裡同名的那份逐字相同（test-process-query-stall.ps1 第 5c 節比對，防漂移）。
+function AgfxF1IsGlobalCopy {
+    try {
+        $here = [IO.Path]::GetFullPath("$PSScriptRoot").TrimEnd('\', '/')
+        $glob = [IO.Path]::GetFullPath((Join-Path $HOME '.claude\hooks')).TrimEnd('\', '/')
+        return ($here -ieq $glob)
+    } catch { return $false }
+}
+$pq = $null
+if (($verdict.decision -eq 'pass' -or $verdict.decision -eq 'ask') -and (-not (AgfxF1IsGlobalCopy))) {
+    $pqLib = Join-Path $PSScriptRoot 'lib-process-query-stall.ps1'
+    if (-not (Test-Path -LiteralPath $pqLib)) {
+        Write-GovLog 'guard-bash' 'procq-lib-unavailable' '找不到 lib-process-query-stall.ps1（整機程序列舉守門本次略過）'
+    } else {
+        try {
+            . (Join-Path $PSScriptRoot 'lib-process-query-stall.ps1')
+            if (Get-Command Ag2bGuardEval -ErrorAction SilentlyContinue) { $pq = Ag2bGuardEval $data }
+            else { Write-GovLog 'guard-bash' 'procq-lib-unavailable' 'lib-process-query-stall.ps1 已載入但未定義 Ag2bGuardEval（整機程序列舉守門本次略過）' }
+        } catch {
+            $pq = $null
+            Write-GovLog 'guard-bash' 'procq-lib-unavailable' "lib-process-query-stall.ps1 載入失敗：$($_.Exception.Message)（整機程序列舉守門本次略過）"
+        }
+    }
+}
+if ($null -ne $pq -and $pq.decision -eq 'deny' -and $pq.json) { [Console]::Out.WriteLine($pq.json); exit 0 }
+if ($preAskWhy) { Ask $preAskWhy }
 
 switch ($verdict.decision) {
     'deny'  { Deny $verdict.why }
     'ask'   { Ask  $verdict.why }
-    'pass'  { exit 0 }
+    'pass'  {
+        if ($null -ne $pq -and $pq.decision -eq 'ask' -and $pq.json) { [Console]::Out.WriteLine($pq.json) }
+        exit 0
+    }
     default { FailVisible "guard-core 回傳未知判定值 '$($verdict.decision)'" }
 }

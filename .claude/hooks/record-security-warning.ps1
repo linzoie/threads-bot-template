@@ -154,11 +154,21 @@ function Read-StdinUtf8 {
         $sin = [Console]::OpenStandardInput()
         if ($null -eq $sin) { return '' }
         $sr = New-Object System.IO.StreamReader($sin, (New-Object System.Text.UTF8Encoding $false))
-        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+        try { return $sr.ReadToEnd().TrimStart([char]0xFEFF) } finally { $sr.Dispose() }
     } catch {
         try { return [Console]::In.ReadToEnd() } catch { return '' }
     }
 }
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
 
 function Get-Snippet([string]$text, [int]$index, [int]$len) {
     try {

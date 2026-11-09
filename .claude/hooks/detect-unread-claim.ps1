@@ -53,10 +53,20 @@ function Read-StdinUtf8 {
     if ($null -ne $b -and $b.Length -gt 0) {
         $start = 0
         if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
-        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start)
+        return [System.Text.Encoding]::UTF8.GetString($b, $start, $b.Length - $start).TrimStart([char]0xFEFF)
     }
     try { return [Console]::In.ReadToEnd() } catch { return '' }
 }
+# Output: stdout/stderr leave as UTF-8 bytes on the raw handles, never through the console code page (at 950 the
+# default writer emits Big5: reason text turns into mojibake and a JSON reason can break). Only when redirected (the
+# real hook case); an interactive console keeps its default writer. Any failure keeps the default writer.
+function Initialize-HookUtf8Output {
+    try {
+        if ([Console]::IsOutputRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetOut($w) }
+        if ([Console]::IsErrorRedirected) { $w = New-Object System.IO.StreamWriter([Console]::OpenStandardError(), (New-Object System.Text.UTF8Encoding $false)); $w.AutoFlush = $true; [Console]::SetError($w) }
+    } catch { }
+}
+Initialize-HookUtf8Output
 $raw = Read-StdinUtf8
 if (-not $raw) { exit 0 }
 try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
@@ -67,6 +77,30 @@ if ($data.stop_hook_active) { exit 0 }
 # 1) 取本回合助理最後訊息。官方文件明文：需要當前回合最終助理文字的 hook 應該用
 #    last_assistant_message，而不要讀 transcript（transcript 非同步寫入、可能落後）。
 $msg = "$($data.last_assistant_message)"
+if ([string]::IsNullOrWhiteSpace($msg)) { exit 0 }
+
+# 1b) 【2026-11-08 起：程式碼區塊整段不看（pending 乙組 #6 P2）】
+# 11-07 實例：正常的交接 prompt 把「先跑 handoff.ps1」寫在三反引號（或波浪線）圍住的區塊裡、
+# 結尾寫「建議」→ 條件①③同時成立被擋。區塊內是「要貼給下一個 session 的文字／範例／輸出」，
+# 不是我在向使用者斷言某檔的行為，所以條件①（核可語氣）與③（行為斷言）都只在區塊外判斷。
+# 行內單反引號（`x.ps1`）照舊看——那是散文裡的指名。
+# 圍欄規則（近似 CommonMark）：開頭行最多縮排 3 格、連續 3 個以上的反引號或波浪線（反引號圍欄的開頭行
+# 其餘部分不得再含反引號，否則是行內程式碼不是圍欄）；收尾行必須是同字元、不少於開頭長度、後面不得帶其他字。
+# 【M1 修正（2026-11-08 審查）】必須找到收尾才剝；找不到收尾（沒收尾、收尾帶尾字、四個開三個收、波浪線開
+# 反引號收、巢狀同長度圍欄最後那個孤兒開頭行）就保留原文照常判斷。初版曾用「或 \z」當收尾後備＝找不到收尾
+# 就從開頭吞到訊息結尾，寫在後面的散文斷言整段消失、hook 放行（fail-open；11-07 交接 prompt 外層包內層
+# 三反引號的形狀正好會觸發）。代價：格式殘缺的訊息可能多擋一次（stop_hook_active 讓下一輪放行）。
+# 殘餘（刻意接受、不得從註解移除）：把真斷言藏進區塊裡會漏報；核可語氣只出現在區塊內、斷言在區塊外也會漏報
+# （區塊外沒有在徵求核可）；regex 超時則整則放行（fail-safe）。
+function Ag2bStripCodeFences {
+    param([string]$Text)
+    try {
+        $re = [regex]::new('(?ms)^[ \t]{0,3}(?<f>`{3,}(?=[^`\n]*\n)|~{3,})[^\n]*\n.*?^[ \t]{0,3}\k<f>[`~]*[ \t\r]*$',
+            [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromMilliseconds(500))
+        return $re.Replace($Text, "`n")
+    } catch { return $null }   # 超時／例外 → 呼叫端放行
+}
+$msg = Ag2bStripCodeFences $msg   # P2-STRIP
 if ([string]::IsNullOrWhiteSpace($msg)) { exit 0 }
 
 # 2) fail-safe：拿不到已讀集合就放行（見檔頭）

@@ -102,6 +102,44 @@ function Invoke-GuardRxReplace {
 }
 
 # ──────────────────────────────────────────────────────────────
+# 理由／日誌的金鑰遮罩（2026-11-09，乙組總審 nonBlocking「#8 S1」，F2）
+#
+# 問題：刪除分類器（1437／1438）、cmd 刪除家族（1615）等規則把整段指令原樣插進 why；
+# 它們先於 #8 的 envkey 規則回傳，所以「NAME=金鑰 rm -rf 某目錄」的 why 帶著金鑰——why 會進 deny 的 stderr、ask 的確認框理由、
+# governance-logs 的決策日誌，而 #8 自己的 why 明明寫「刻意不回顯金鑰」。
+# 做法：在對外唯一入口 Get-GuardVerdict 的出口把 why 裡的金鑰換成固定遮罩字樣（判定與 why 類別開頭不動，D5 靠 why 開頭／關鍵字比對）。
+# 金鑰樣式只有一份（Get-GuardKeyCs）：#8 的 envkey 規則與這裡共用，不會各改各的而漂移。
+# 遮罩比 envkey 規則的「賦值位置」更寬：金鑰出現在任何位置都遮；比對尾端再多吃一段 [A-Za-z0-9_.-]*，
+# 因為樣式只涵蓋金鑰的前綴（例：sk- 的樣式停在最後一個數字、JWT 的簽章段不在樣式內），不吃尾巴會洩出後半截；
+# 私鑰區塊從 BEGIN 行遮到 END 行（沒有 END 就遮到字串結尾）。
+# 遮罩本身逾時／出錯＝判斷不了＝不得原樣放出：保留第一個全形括號或冒號之前的類別字樣，其餘整段略去。
+# 殘餘（明文）：沒有固定前綴的金鑰（Mistral、Z.ai 等）與執行期才組出的字串遮不到，與 #8 同一邊界。
+# ──────────────────────────────────────────────────────────────
+function Get-GuardKeyCs {
+    return '(?-i:sk-ant-[A-Za-z0-9_-]{20,}|sk-(?=[A-Za-z0-9_-]{24})(?![a-z0-9_]*(?:-[a-z0-9_]*){2,}(?![A-Za-z0-9_-]))[A-Za-z_-]*[0-9]|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{52}|eyJ[A-Za-z0-9_-]{18,}\.eyJ[A-Za-z0-9_-]{18,}|-{5}BEGIN [A-Z ]*PRIVATE KEY-{5})'
+}
+
+function Get-GuardKeyMask {
+    return '‹已遮罩金鑰›'
+}
+
+function Protect-GuardSecrets {
+    param([AllowNull()] [AllowEmptyString()] [string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $mask = Get-GuardKeyMask
+    try {
+        $t = (Get-GuardRx '(?-i:-{5}BEGIN [A-Z ]*PRIVATE KEY-{5})[\s\S]*?(?:(?-i:-{5}END [A-Z ]*PRIVATE KEY-{5})|$)').Replace($Text, $mask)
+        $t = (Get-GuardRx ((Get-GuardKeyCs) + '[A-Za-z0-9_.-]*')).Replace($t, $mask)
+        return $t
+    } catch {
+        $cut = $Text.IndexOfAny([char[]]@([char]0xFF08, [char]0xFF1A))
+        $head = ''
+        if ($cut -gt 0) { $head = $Text.Substring(0, $cut) }
+        return ($head + '（內容無法安全遮罩，已略去）')
+    }
+}
+
+# ──────────────────────────────────────────────────────────────
 # 遞迴刪除指令的目標分級（posix rm 與 PowerShell 刪除家族）
 #   回傳 'deny' / 'ask' / 'allow' / $null（此段落非刪除指令或非遞迴）
 #   'allow' 非終結值——呼叫端仍要繼續掃描同一段指令的其他 DENY/ASK 樣式。
@@ -568,11 +606,833 @@ function Test-WfDirWriteWhole {
 }
 
 # ──────────────────────────────────────────────────────────────
+# P-2（2026-11-07，runaway-process-prevention 規格 Task 2.1）：互動直譯器啟動規則
+#
+# 【為什麼】10-19 事故：Claude Code 的 Bash／PowerShell 工具給子程序的 stdin 是 NUL，Python 3.13 以上
+# 在「不帶腳本、單獨連字號、或沒有資料餵入」時進互動 REPL，讀 NUL 永遠回空、無限空轉（一支 python
+# 空轉 4 天寫了 230 GB）。全域 env PYTHON_BASIC_REPL=1 帶 -I／-E 時無效，所以本規則不看那些旗標。
+#
+# 【判定】以「段」（| ; && || & 換行，引號內不切）為單位，指令位置的 leaf（去路徑、去 .exe、不分大小寫）
+# 是 python／python3／pythonN／pythonN.N／pythonw／py，或 uv／pipx／poetry／pipenv 的 run 之後的第一個
+# token，前面可有 timeout／nohup／env（含 X=Y）／exec／command／nice／time 前綴與 then／do 等關鍵字。
+# 該段同時符合 → deny：沒有腳本路徑引數、沒有 -c、沒有 -m、沒有 --version／-V／-h／--help；
+# 沒有左側管線；沒有一般檔 < 重導（/dev/null 與 nul 視為無資料）；沒有非空 heredoc／here-string。
+# 其他旗標（-I -E -q -u -X -W -B -O -s -S -i；py 的 -3／-3.14）不改變判定。左側是 xargs／find -exec
+# 時 leaf 不是 python 所以自然放行；PowerShell 的 `$x | python -` 有左側管線，放行。
+#
+# 【空 heredoc 要在 A1 之前判】A1 會把換行換成「 ; 」，heredoc 本體與界定行就分不清了；所以本規則拿
+# 原始字串自己掃（Get-IiSegments），不經 A1；空 body＝界定行緊接在標記行後（或標記後沒有任何行）；
+# 只有註解或空白行的 body 算非空（照規格放行）。
+#
+# 【與其他 deny 的優先序（M2，2026-11-07）】Get-GuardVerdictSingle 先跑其餘全部規則（Core），Core 判 deny
+# 就以 Core 為準——why 類別（例如「程序終止」）決定 guard-bash 要不要計 D5 與不回顯原文，不能被本規則
+# 蓋掉；Core 不是 deny 才輪到本規則（deny 勝過 Core 的 ask／allow）。
+#
+# 【殼包裹】`bash -c '…'` 內層由 Get-GuardVerdict 的 Expand-ShellWrapper 展開後再走一次本規則。
+# 【fail-open（刻意）】本規則任何例外／超過 30000 字元都回 $null：這是防事故的規則不是安全邊界，
+# 判不了就放行好過把所有含 python 字樣的指令都擋掉（與逾時＝命中的安全類規則不同）。
+# 【已知限制】變數程式名（$p=python; $p -）、命令替換、寫成 .sh 再跑、node child_process spawn：
+# 字面比對看不到（guard-cases 有 known- 前綴案例釘住）。
+# ──────────────────────────────────────────────────────────────
+function Get-IiSegments {
+    # 回傳 List：每項 @{ text; pipe }。pipe＝此段左側是單一 |（stdin 來自管線）。heredoc 標記換成
+    # @@HDNE@@（非空本體）或 @@HDEMPTY@@（空本體）；here-string 換成 @@HERESTR@@。
+    param([string]$Text)
+    $t = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $n = $t.Length
+    $segs = New-Object System.Collections.Generic.List[object]
+    $hds = New-Object System.Collections.Generic.List[object]
+    $pending = New-Object System.Collections.Generic.List[object]
+    $sb = New-Object System.Text.StringBuilder
+    $curPipe = $false
+    $quote = [char]0
+    $sq = [char]39
+    $dq = [char]34
+    $bs = [char]92
+    $bt = [char]96
+    $nl = [char]10
+    $i = 0
+    while ($i -lt $n) {
+        $c = $t[$i]
+        if ($quote -ne [char]0) {
+            [void]$sb.Append($c)
+            if ($quote -ceq $dq -and ($c -ceq $bs -or $c -ceq $bt) -and ($i + 1) -lt $n) { $i++; [void]$sb.Append($t[$i]) }
+            elseif ($c -ceq $quote) { $quote = [char]0 }
+            $i++
+            continue
+        }
+        if ($c -ceq $sq -or $c -ceq $dq) { $quote = $c; [void]$sb.Append($c); $i++; continue }
+        if ($c -ceq $bs -or $c -ceq $bt) {
+            if (($i + 1) -lt $n) {
+                if ($t[$i + 1] -ceq $nl) { $i += 2; continue }
+                [void]$sb.Append($c); [void]$sb.Append($t[$i + 1]); $i += 2; continue
+            }
+            [void]$sb.Append($c); $i++; continue
+        }
+        if ($c -ceq '#' -and ($sb.Length -eq 0 -or [char]::IsWhiteSpace($sb[$sb.Length - 1]))) {
+            while ($i -lt $n -and $t[$i] -cne $nl) { $i++ }
+            continue
+        }
+        if ($c -ceq '<') {
+            if (($i + 1) -lt $n -and $t[$i + 1] -ceq '<') {
+                if (($i + 2) -lt $n -and $t[$i + 2] -ceq '<') { [void]$sb.Append(' @@HERESTR@@ '); $i += 3; continue }
+                $j = $i + 2
+                $strip = $false
+                if ($j -lt $n -and $t[$j] -ceq '-') { $strip = $true; $j++ }
+                while ($j -lt $n -and ($t[$j] -ceq ' ' -or $t[$j] -ceq [char]9)) { $j++ }
+                $delim = ''
+                if ($j -lt $n -and ($t[$j] -ceq $sq -or $t[$j] -ceq $dq)) {
+                    $qc = $t[$j]; $j++
+                    $e = $t.IndexOf($qc, $j)
+                    if ($e -lt 0) { $e = $n }
+                    $delim = $t.Substring($j, $e - $j)
+                    $j = [Math]::Min($n, $e + 1)
+                } else {
+                    $k = $j
+                    while ($k -lt $n -and ' ;|&<>()'.IndexOf($t[$k]) -lt 0 -and $t[$k] -cne $nl -and $t[$k] -cne [char]9) { $k++ }
+                    $delim = $t.Substring($j, $k - $j)
+                    $j = $k
+                }
+                if ($delim.Length -gt 0) {
+                    $hd = @{ delim = $delim; strip = $strip; nonEmpty = $false }
+                    $hds.Add($hd)
+                    $pending.Add($hd)
+                    [void]$sb.Append(' @@HD' + ($hds.Count - 1) + '@@ ')
+                    $i = $j
+                    continue
+                }
+            }
+            [void]$sb.Append($c); $i++; continue
+        }
+        $sep = $null
+        if ($c -ceq ';') { $sep = 'semi'; $i++ }
+        elseif ($c -ceq '&') {
+            $prev = if ($sb.Length -gt 0) { $sb[$sb.Length - 1] } else { [char]0 }
+            $next = if (($i + 1) -lt $n) { $t[$i + 1] } else { [char]0 }
+            if ($prev -ceq '>' -or $prev -ceq '<' -or $next -ceq '>') { [void]$sb.Append($c); $i++; continue }
+            if ($next -ceq '&') { $sep = 'and'; $i += 2 } else { $sep = 'bg'; $i++ }
+        }
+        elseif ($c -ceq '|') {
+            if (($i + 1) -lt $n -and $t[$i + 1] -ceq '|') { $sep = 'or'; $i += 2 }
+            else { $sep = 'pipe'; $i++; if ($i -lt $n -and $t[$i] -ceq '&') { $i++ } }
+        }
+        elseif ($c -ceq $nl) {
+            $sep = 'nl'
+            if ($pending.Count -gt 0) {
+                $pos = $i + 1
+                foreach ($hd in $pending) {
+                    $cnt = 0
+                    while ($pos -lt $n) {
+                        $e = $t.IndexOf($nl, $pos)
+                        if ($e -lt 0) { $e = $n }
+                        $line = $t.Substring($pos, $e - $pos)
+                        $pos = $e + 1
+                        if ($hd.strip) { $line = $line.TrimStart([char]9) }
+                        if ($line -ceq $hd.delim) { break }
+                        $cnt++
+                    }
+                    $hd.nonEmpty = ($cnt -gt 0)
+                }
+                $pending.Clear()
+                $i = $pos
+            } else { $i++ }
+        }
+        if ($null -ne $sep) {
+            $txt = $sb.ToString()
+            [void]$sb.Clear()
+            if ($txt.Trim().Length -gt 0) { $segs.Add(@{ text = $txt; pipe = $curPipe }) }
+            $curPipe = ($sep -ceq 'pipe')
+            continue
+        }
+        [void]$sb.Append($c)
+        $i++
+    }
+    $txt = $sb.ToString()
+    if ($txt.Trim().Length -gt 0) { $segs.Add(@{ text = $txt; pipe = $curPipe }) }
+    for ($h = 0; $h -lt $hds.Count; $h++) {
+        $rep = if ($hds[$h].nonEmpty) { '@@HDNE@@' } else { '@@HDEMPTY@@' }
+        foreach ($s in $segs) { $s.text = $s.text.Replace('@@HD' + $h + '@@', $rep) }
+    }
+    return , $segs
+}
+
+function Get-IiLeaf {
+    param([string]$Token)
+    $x = $Token.Trim([char]34, [char]39)
+    $x = ($x -split '[\\/]')[-1].ToLowerInvariant()
+    if ($x.EndsWith('.exe')) { $x = $x.Substring(0, $x.Length - 4) }
+    return $x
+}
+
+function Test-IiSegment {
+    # 此段是不是「沒有資料餵入、也沒有腳本／-c／-m／版本旗標」的直譯器啟動？是回描述字串，否回 $null。
+    param([string]$Text, [bool]$LeftPipe)
+    $s = $Text.Trim()
+    $s = [regex]::Replace($s, '^(?:[\s({]|\$\()+', '')
+    $s = $s.TrimEnd([char]41, [char]125, [char]32, [char]9)
+    if ($s.Length -eq 0) { return $null }
+    $toks = [regex]::Matches($s, '(?:"[^"]*"|''[^'']*''|[^\s"''])+')
+    # 1. 剝掉重導向，記錄有沒有資料餵入
+    $av = New-Object System.Collections.Generic.List[string]
+    $data = $false
+    for ($k = 0; $k -lt $toks.Count; $k++) {
+        $tk = $toks[$k].Value
+        if ($tk -ceq '@@HDNE@@' -or $tk -ceq '@@HERESTR@@') { $data = $true; continue }
+        if ($tk -ceq '@@HDEMPTY@@') { continue }
+        $m = [regex]::Match($tk, '^\d*<(.*)$')
+        if ($m.Success) {
+            $target = $m.Groups[1].Value
+            if ($target.Length -eq 0 -and ($k + 1) -lt $toks.Count) { $k++; $target = $toks[$k].Value }
+            $target = $target.Trim([char]34, [char]39)
+            if ($target.StartsWith('&')) { continue }
+            if ($target -imatch '^(?:/dev/null|nul|\$null)$') { continue }
+            $data = $true
+            continue
+        }
+        $m = [regex]::Match($tk, '^(?:\d*|&)>>?(.*)$')
+        if ($m.Success) {
+            if ($m.Groups[1].Value.Length -eq 0 -and ($k + 1) -lt $toks.Count) { $k++ }
+            continue
+        }
+        $av.Add($tk)
+    }
+    if ($av.Count -eq 0) { return $null }
+    # 2. 找指令位置（跳過賦值、關鍵字、timeout／nohup／env／exec／command／nice／time 前綴）
+    $p = 0
+    $guard = 0
+    while ($p -lt $av.Count -and $guard -lt 16) {
+        $guard++
+        $tk = $av[$p]
+        if ($tk -cmatch '^[A-Za-z_]\w*=') { $p++; continue }
+        if ($tk -cmatch '^(?:then|do|else|elif|if|while|until|!)$') { $p++; continue }
+        $lf = Get-IiLeaf $tk
+        if ($lf -cmatch '^(?:timeout|nohup|env|exec|command|nice|time|sudo|setsid)$') {
+            $p++
+            $dur = $false
+            while ($p -lt $av.Count) {
+                $o = $av[$p]
+                if ($o -cmatch '^-') {
+                    if ($lf -ceq 'command' -and $o -cmatch '^-[a-zA-Z]*[vV]') { return $null }
+                    $p++
+                    $valued = switch ($lf) { 'timeout' { '^(?:-k|-s)$' } 'nice' { '^-n$' } 'env' { '^(?:-u|-C)$' } 'sudo' { '^(?:-u|-g|-C|-h|-p|-r|-t)$' } default { '^$' } }
+                    if ($o -cmatch $valued) { $p++ }
+                    continue
+                }
+                if ($lf -ceq 'timeout' -and -not $dur -and $o -cmatch '^\d+(?:\.\d+)?[smhd]?$') { $dur = $true; $p++; continue }
+                if ($o -cmatch '^[A-Za-z_]\w*=') { $p++; continue }
+                break
+            }
+            continue
+        }
+        break
+    }
+    if ($p -ge $av.Count) { return $null }
+    $leaf = Get-IiLeaf $av[$p]
+    if ($leaf -cmatch '^(?:uv|pipx|poetry|pipenv)$') {
+        $q = $p + 1
+        while ($q -lt $av.Count -and $av[$q] -cmatch '^-') { $q++ }
+        if ($q -ge $av.Count -or $av[$q] -cne 'run') { return $null }
+        $q++
+        while ($q -lt $av.Count -and $av[$q] -cmatch '^-') {
+            if ($av[$q] -cmatch '^(?:--with|--with-requirements|--python|-p|--project|--directory|--env-file|--package|--group|--extra|--index|--from)$') { $q++ }
+            $q++
+        }
+        if ($q -ge $av.Count) { return $null }
+        $p = $q
+        $leaf = Get-IiLeaf $av[$p]
+    }
+    if ($leaf -cnotmatch '^(?:python\d*(?:\.\d+)*[a-z]?|pythonw\d*|py)$') { return $null }
+    $isPy = ($leaf -ceq 'py')
+    # 3. 旗標：有腳本路徑／-c／-m／版本與說明旗標就放行；單獨 - 與其他旗標不改變判定
+    $q = $p + 1
+    while ($q -lt $av.Count) {
+        $a = $av[$q]
+        if ($a -ceq '-') { break }
+        if ($a -cmatch '^--') {
+            if ($a -cmatch '^--(?:version|help)$') { return $null }
+            # M1：py --list／--list-paths 只列出已安裝版本就結束，不進 REPL
+            if ($isPy -and $a -cmatch '^--list(?:-paths)?$') { return $null }
+            $q++
+            continue
+        }
+        if ($a -cmatch '^-') {
+            # M1：-0／-0p（列出已安裝版本）必須先於版本選擇器判斷——選擇器的 \d+ 也吃得下 -0，
+            # 順序放反會讓單獨的 -0 被當成版本選擇器跳過、永遠到不了這一行（py -0 被誤擋）
+            if ($isPy -and $a -cmatch '^-0') { return $null }
+            if ($isPy -and $a -cmatch '^-(?:\d+(?:\.\d+)?(?:-\d+)?|V:\S+)$') { $q++; continue }
+            for ($ci = 1; $ci -lt $a.Length; $ci++) {
+                $ch = $a[$ci]
+                if ($ch -ceq 'c' -or $ch -ceq 'm' -or $ch -ceq 'V' -or $ch -ceq 'h' -or $ch -ceq '?') { return $null }
+                if ($ch -ceq 'W' -or $ch -ceq 'X') { if ($ci -eq ($a.Length - 1)) { $q++ }; break }
+            }
+            $q++
+            continue
+        }
+        return $null
+    }
+    # 4. 沒有腳本：有資料餵入就放行（stdin 不是 NUL／不是空的）
+    if ($LeftPipe -or $data) { return $null }
+    return $av[$p]
+}
+
+function Get-InteractiveInterpreterVerdict {
+    param([AllowEmptyString()] [string]$Command)
+    try {
+        # 超過 30000 字元不掃：逐字元掃描是線性但常數大（實測 10 萬字元 13 秒），真實指令遠小於此
+        if ([string]::IsNullOrEmpty($Command) -or $Command.Length -gt 30000) { return $null }
+        $pre = '(?<![\w.\-])(?:py(?![\w\-])|python|uv(?![\w\-])|pipx|poetry|pipenv)'
+        if ((Test-GuardRx $Command $pre) -ne $true) { return $null }
+        $segs = Get-IiSegments $Command
+        foreach ($sg in $segs) {
+            if ((Test-GuardRx $sg.text $pre) -ne $true) { continue }
+            $hit = Test-IiSegment $sg.text ([bool]$sg.pipe)
+            if ($null -ne $hit) {
+                return @{ decision = 'deny'; why = "互動直譯器啟動（$hit）：沒有腳本、-c、-m、版本旗標，也沒有資料餵入——工具的 stdin 是 NUL，Python 3.13 以上會進 REPL 無限空轉（10-19 事故）。改道：探測版本用 --version；執行程式用 -c 或先 Write 腳本檔再跑；要餵資料用非空 heredoc 或管線（printf ... | python -）。本規則不看 -I／-E 等旗標。" }
+            }
+        }
+        return $null
+    } catch { return $null }
+}
+
+# ──────────────────────────────────────────────────────────────
+# R1（with-child 登記目錄寫入）— 2026-11-08 乙組 #3b（使用者選選項 1「依你建議GO」）：
+# 舊版寬鬆 R1 當 deny 底＋已知誤擋白名單。
+#
+# 【為什麼改走這條】乙組 #3 先走 A 案（判定縮到「同一段的寫入目標」，75eb3d7）、再補 M1–M5（ae3877e），兩輪驗證腿仍找到
+# N1–N3：shell 寫法無法用字面拆解窮舉，每補一處就在別處多出比舊版更寬鬆的漏擋（其中兩個是修正自己帶進來的）。
+# 所以改成：denyPatterns 內的 R1 規則維持 6311d73 舊版原文（整串 session-state、with-child、寫入符號各出現一次就 deny＋D5），
+# 命中之後才多一道 Get-R1KnownMisfire——**整段指令完全吻合**下列某個已知形狀才放行。不是「看不到寫入登記目錄就放行」。
+# 不變式（有 harness 逐案比對）：新版絕不比舊版寬鬆，唯一的放寬就是這份白名單。
+#
+# 【白名單形狀】每條對應一次真實誤擋（pending-decisions R1 條目的 4 次）或使用者核准的情境（說明文字／commit 訊息）：
+#   ①先 test -e／[ -e ]／Test-Path 讀 session-state 狀態檔，再 && node …/with-child.mjs run [--timeout=N] -- node 腳本.mjs [參數]
+#     把輸出導到暫存目錄的字面路徑（ro:test＋wc-run）；
+#   ②PowerShell 唯讀列表（Get-ChildItem … | ForEach-Object { '格式 > 字串' -f … }），引號內含 > 字元（ps-ro）；
+#   ③cp [-pafvnu] 登記區某檔 暫存目錄字面路徑（備份），後面接 with-child.mjs run／list（cp＋wc-run）；
+#   ④printf／echo／cat／Set-Content／Add-Content／heredoc 把「含兩個字面的說明文字」寫到暫存目錄或 memory 目錄的字面路徑
+#     （text-write）；文字用單引號或無展開的雙引號，或先指派給白名單變數名（msg 等）再引用；
+#   ⑤git commit -m '含字面的訊息'（gitcommit）。
+# 另有 ls／cat／head／tail／stat／wc／grep 與 test 這類唯讀指令可串在上面形狀的前後（ro:*）。
+#
+# 【判定單位與通用拒絕】指令超過 R1WlMaxLen（1500）字元或切點超過 R1WlMaxStages（10）、含控制字元、反引號或 ^（單引號內除外）、
+# $' 與 $"、反斜線接引號／空白／行尾、無法平衡的引號、含 <（輸入重導向／heredoc，唯一例外是下面的 cat heredoc 整段形狀）
+# → 不放行（維持舊版 deny）。耗時：只有舊版 rx 已命中的指令才多跑這道判定；上限讓最壞形狀約等於舊版對超長輸入的耗時。
+# 指令以 ; && || 單 & 換行切成陳述句、| 切成階段（引號內不切）；
+# **每一個階段都必須吻合某個形狀**，任何一段不吻合（cd、變數當動詞、for／if、sh -c、mv／rm、重導向目標不是字面路徑…）
+# 整串就維持 deny。重導向目標必須是「字面暫存路徑」（Test-R1Lit：磁碟代號／msys／/tmp 或 $env:TEMP 起頭、位於 Temp 或 memory
+# 目錄、不含兩個登記字面、無 ..／萬用字元／變數／8.3 短名）。含程式碼特徵的文字（writeFileSync(、[IO.File]::、require( 等）
+# 不當說明文字。含 with-child run 的指令不得同時含 text-write（避免「先把含字面的程式寫進暫存檔、同一串再執行」）。
+#
+# 【殘餘（明文）】①清單外的正常寫法仍會誤擋（出現時補例外與測試，見 pending-decisions）；②說明文字寫進暫存檔本身是白名單的已知放寬——
+# 舊版靠兩個字面同時出現擋住它，但舊版也擋不住用字串拼接組路徑的寫法，與 webfetch 目錄規則 F3 同一邊界；
+# ③直譯器執行期組路徑、萬用字元、8.3 短名、junction——字面比對看不到。
+# D5 taint 計數與 why 類別不動（why 文字仍以「寫入 with-child 登記目錄」開頭，guard-bash 靠它計數）。
+# ──────────────────────────────────────────────────────────────
+$script:R1WlShape = $null
+$script:R1WlMaxLen = 1500
+$script:R1WlMaxStages = 10
+$script:R1SplitRx = '"[^"]*"|''[^'']*''|&&|\|\||[;\r\n]|(?<!>)&(?!>)|\|'
+$script:R1TokRx = '(?:"[^"]*"|''[^'']*''|[^\s"''])+'
+$script:R1QuotedRx = '"[^"]*"|''[^'']*'''
+$script:R1StageBalancedRx = '^(?:[^"'']|"[^"]*"|''[^'']*'')*$'
+$script:R1RxSplit = New-Object System.Text.RegularExpressions.Regex($script:R1SplitRx, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromMilliseconds(500))
+$script:R1RxTok = New-Object System.Text.RegularExpressions.Regex($script:R1TokRx, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromMilliseconds(500))
+$script:R1RxQuoted = New-Object System.Text.RegularExpressions.Regex($script:R1QuotedRx, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromMilliseconds(500))
+$script:R1LitBadChars = [char[]](@(0..31) + [int[]][char[]]'"''`*?[]{}<>|&;^%!#')
+$script:R1PathBadChars = [char[]](@(0..31) + [int[]][char[]]'"''`*?[]{}()<>|&;^%!#')
+$script:R1WsChars = [char[]](' ', "`t", "`n", "`r")
+$script:R1PathVarRx = New-Object System.Text.RegularExpressions.Regex('^\$(?:home|env:(?:userprofile|temp|tmp|localappdata|appdata))(?=[\\/])', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromMilliseconds(500))
+$script:R1WlRoSet = @{}
+foreach ($ag2n in @('ls', 'cat', 'head', 'tail', 'stat', 'wc', 'grep', 'egrep', 'fgrep', 'echo', 'printf', 'get-childitem', 'gci', 'dir', 'get-content', 'gc', 'type', 'get-item', 'gi', 'test-path', 'select-string', 'sls')) { $script:R1WlRoSet[$ag2n] = $true }
+$script:R1WlPsSet = @{}
+foreach ($ag2n in @('gci', 'dir', 'ls', 'get-childitem', 'gc', 'cat', 'type', 'get-content', 'gi', 'get-item', 'gp', 'get-itemproperty', 'test-path', 'sls', 'select-string', 'measure', 'measure-object', 'where', 'where-object', '?', 'foreach', 'foreach-object', '%', 'select', 'select-object', 'sort', 'sort-object', 'ft', 'fl', 'format-table', 'format-list', 'out-string', 'out-host', 'convertfrom-json', 'convertto-json', 'group', 'group-object', 'write-output', 'write-host', 'echo', 'get-date', 'join-path', 'split-path')) { $script:R1WlPsSet[$ag2n] = $true }
+$script:R1WlPsNounRx = '^(?:get-childitem|get-content|get-item|get-itemproperty|test-path|select-string|measure-object|where-object|foreach-object|select-object|sort-object|format-table|format-list|out-string|out-host|convertfrom-json|convertto-json|group-object|write-output|write-host|get-date|join-path|split-path)$'
+$script:R1WlPsWordRx = '^(?:gci|dir|ls|gc|cat|type|gi|gp|sls|measure|where|foreach|select|sort|ft|fl|group|echo|name|length|fullname|lastwritetime|creationtime|extension|count|basename|mode|attributes|directoryname|size|value|path|pschildname|true|false|null|q|object|property|first|last|skip|descending|unique|stream|width)$'
+$script:R1WlPsDangerRx = '(?<![\w$.\-:@])(?:iex|icm|ii|saps|start|spps|kill|ni|si|sp|rp|clp|cli|sc|ac|clc|cpi|mi|rni|ri|rm|rd|del|erase|cp|copy|mv|move|ren|rename|tee|touch|install|sed|node|sh|bash|cmd|pwsh|powershell|python|py|perl|ruby|php|wscript|cscript|mshta|call|curl|wget|iwr|irm|ssh|scp|reg|net|setx|schtasks|wmic|certutil|bitsadmin|rundll32|regsvr32|eval|exec|source|xargs|find|epcsv|sal|nal)(?![\w\-])'
+$script:R1WlMethodOkRx = '^(?:tostring|trim|trimend|trimstart|split|substring|replace|toupper|tolower|contains|startswith|endswith|join|format)$'
+$script:R1WlCodeLikeRx = '(?:writefile|appendfile|copyfile|renamefile|createwritestream|unlink|rename|rmdir|rm)(?:sync)?\s*\(|\bopen\s*\(|\[(?:system\.)?io\.file\]::|\bfs\.|\brequire\s*\(|child_process|\.lastwritetime|\bimport\b|node:|\bprocess\.|new\s+function|\beval\s*\(|\bexec(?:sync)?\s*\('
+$script:R1WlVarNameRx = '^(?:msg|message|text|note|notes|body|content|line|txt|desc|memo|m|s|t)$'
+
+function Test-R1Rx {
+    # 位置參數（Text, Pattern）；逾時會拋例外，由 Get-R1KnownMisfire 的 catch 接住＝不放行（fail-closed）。
+    # 刻意不用 param() 與 Test-GuardRx：這個函式在白名單判定裡被呼叫上百次，函式呼叫成本是主要耗時
+    $rx = $script:GuardRxCache[[string]$args[1]]
+    if ($null -eq $rx) { $rx = Get-GuardRx ([string]$args[1]) }
+    return $rx.IsMatch([string]$args[0])
+}
+
+function Get-R1Unquote {
+    # token 整個是一個引號字串→@{ q; s=內容 }，否則 q=''、s=原文
+    param([string]$Tok)
+    if ($Tok.Length -ge 2) {
+        $c0 = $Tok.Substring(0, 1)
+        if (($c0 -eq '"' -or $c0 -eq "'") -and $Tok.Substring($Tok.Length - 1) -eq $c0 -and $Tok.IndexOf($c0, 1) -eq ($Tok.Length - 1)) {
+            return @{ q = $c0; s = $Tok.Substring(1, $Tok.Length - 2) }
+        }
+    }
+    return @{ q = ''; s = $Tok }
+}
+
+function Test-R1Lit {
+    # 字面暫存路徑：寫入目標必須是它才算「寫到非登記路徑」
+    param([string]$Tok)
+    if ([string]::IsNullOrEmpty($Tok)) { return $false }
+    $u = Get-R1Unquote $Tok
+    $q = [string]$u.q
+    $s = [string]$u.s
+    if ($s.Length -eq 0 -or $s.Length -gt 300) { return $false }
+    if ($q -eq '' -and $s.IndexOfAny($script:R1WsChars) -ge 0) { return $false }
+    if ($s.IndexOfAny($script:R1LitBadChars) -ge 0) { return $false }
+    $low = $s.ToLowerInvariant().Replace('\', '/')
+    $var = ''
+    if ($low.StartsWith('$') -or $low.StartsWith('~')) {
+        foreach ($pre in @('$env:temp', '$env:tmp', '$env:userprofile', '$home', '~')) {
+            if ($low.StartsWith(($pre + '/'), [System.StringComparison]::Ordinal)) { $var = $pre; break }
+        }
+    }
+    if ($var -ne '') {
+        if ($q -eq "'") { return $false }
+        $low = $low.Substring($var.Length)
+    }
+    if ($low.Contains('$')) { return $false }
+    if ($low.Contains('session-state') -or $low.Contains('with-child')) { return $false }
+    if ($low.Contains('/../') -or $low.EndsWith('/..', [System.StringComparison]::Ordinal)) { return $false }
+    if ($low.Contains('~') -and (Test-R1Rx $low '~[0-9]')) { return $false }
+    $abs = ($var -ne '')
+    if (-not $abs -and $low.Length -ge 3) {
+        if ([char]::IsLetter($low[0]) -and $low[1] -eq ':' -and $low[2] -eq '/') { $abs = $true }
+        elseif ($low[0] -eq '/' -and [char]::IsLetter($low[1]) -and $low[2] -eq '/') { $abs = $true }
+        elseif ($low.StartsWith('/tmp/', [System.StringComparison]::Ordinal)) { $abs = $true }
+    }
+    if (-not $abs) { return $false }
+    if ($var -eq '$env:temp' -or $var -eq '$env:tmp') { return $true }
+    return ($low.Contains('/appdata/local/temp/') -or $low.StartsWith('/tmp/', [System.StringComparison]::Ordinal) -or $low.Contains('/memory/'))
+}
+
+function Test-R1PathAny {
+    # 唯讀用途的路徑 token（可含登記字面）：無空白（除非整個被引號包住）、無萬用字元／命令替換；
+    # $ 只准 $HOME／$env:USERPROFILE／TEMP／TMP／LOCALAPPDATA／APPDATA 開頭（任意變數會被字詞分割成旗標，如 cp -t）
+    param([string]$Tok)
+    if ([string]::IsNullOrEmpty($Tok)) { return $false }
+    $u = Get-R1Unquote $Tok
+    $s = [string]$u.s
+    if ($s.Length -eq 0 -or $s.Length -gt 400) { return $false }
+    if ($s.StartsWith('-')) { return $false }
+    if ([string]$u.q -eq '' -and $s.IndexOfAny($script:R1WsChars) -ge 0) { return $false }
+    if ($s.IndexOfAny($script:R1PathBadChars) -ge 0) { return $false }
+    if ($s.Contains('$')) {
+        $r = $script:R1PathVarRx.Replace($s, '')
+        if ($r.Contains('$')) { return $false }
+    }
+    return $true
+}
+
+function Test-R1Inert {
+    # 純文字 token：單引號字串、無命令替換的雙引號字串、單純字詞、或單一變數（只當資料）
+    param([string]$Tok)
+    if ([string]::IsNullOrEmpty($Tok)) { return $false }
+    $u = Get-R1Unquote $Tok
+    if ([string]$u.q -eq "'") { return $true }
+    if ([string]$u.q -eq '"') {
+        $s = [string]$u.s
+        if ($s.Contains('$(') -or $s.Contains('${') -or $s.Contains('`')) { return $false }
+        return $true
+    }
+    return ((Test-R1Rx $Tok '^[\w.,:=@%+/\\\-]+$') -or (Test-R1Rx $Tok '^\$[A-Za-z_]\w*$'))
+}
+
+function Test-R1TextOk {
+    # 寫進檔案的說明文字：純文字且不像程式碼
+    param([string]$Tok)
+    if (-not (Test-R1Inert $Tok)) { return $false }
+    return (-not (Test-R1Rx $Tok $script:R1WlCodeLikeRx))
+}
+
+function Test-R1Flag {
+    param([string]$Tok)
+    return (Test-R1Rx $Tok '^--?[A-Za-z0-9][\w=.,:\-]*$')
+}
+
+function Split-R1Statements {
+    # 引號外以 ; && || 單& 換行切陳述句、| 切階段（引號內不切）。回傳 ArrayList(ArrayList(string))；
+    # 階段數超過上限、任一階段引號不平衡 → $null
+    param([string]$Text)
+    $stmts = New-Object System.Collections.ArrayList
+    $stages = New-Object System.Collections.ArrayList
+    $pos = 0
+    $cuts = 0
+    foreach ($m in $script:R1RxSplit.Matches($Text)) {
+        $v = [string]$m.Value
+        $c = $v.Substring(0, 1)
+        if ($c -eq '"' -or $c -eq "'") { continue }
+        [void]$stages.Add($Text.Substring($pos, $m.Index - $pos))
+        $pos = $m.Index + $m.Length
+        $cuts++
+        if ($cuts -gt $script:R1WlMaxStages) { return $null }
+        if ($c -eq '|' -and $v.Length -eq 1) { continue }
+        [void]$stmts.Add($stages)
+        $stages = New-Object System.Collections.ArrayList
+    }
+    [void]$stages.Add($Text.Substring($pos))
+    [void]$stmts.Add($stages)
+    foreach ($ss in $stmts) {
+        foreach ($sg in $ss) {
+            if (-not (Test-R1Rx ([string]$sg) $script:R1StageBalancedRx)) { return $null }
+        }
+    }
+    return , $stmts
+}
+
+function Get-R1Tokens {
+    # 階段（引號已平衡）→ token 清單（引號保留在 token 內）。引號外有 < → $null
+    param([string]$Stage)
+    $noq = $script:R1RxQuoted.Replace($Stage, '')
+    if ($noq.IndexOf('<') -ge 0) { return $null }
+    $toks = New-Object System.Collections.ArrayList
+    foreach ($m in $script:R1RxTok.Matches($Stage)) { [void]$toks.Add([string]$m.Value) }
+    return , $toks
+}
+
+function Get-R1Redirects {
+    # token 清單抽出重導向。目標必須是字面暫存路徑（或丟棄／fd 複製）；否則 $null。回 @{ words; outs }
+    param($Toks)
+    $words = New-Object System.Collections.ArrayList
+    $outs = 0
+    $i = 0
+    while ($i -lt $Toks.Count) {
+        $t = [string]$Toks[$i]
+        $i++
+        $first = $t.Substring(0, 1)
+        if ($first -eq '"' -or $first -eq "'") { [void]$words.Add($t); continue }
+        $m = [regex]::Match($t, '^(\d*>>?|&>>?)(.*)$')
+        if (-not $m.Success) {
+            if ($t.Contains('>')) { return $null }
+            [void]$words.Add($t)
+            continue
+        }
+        $rest = [string]$m.Groups[2].Value
+        if ($rest -eq '') {
+            if ($i -ge $Toks.Count) { return $null }
+            $rest = [string]$Toks[$i]
+            $i++
+        }
+        if (Test-R1Rx $rest '^&\d+-?$') { continue }
+        if ($rest.StartsWith('&')) { return $null }
+        if (Test-R1Rx $rest '^(?:/dev/null|\$null|nul)$') { continue }
+        if (-not (Test-R1Lit $rest)) { return $null }
+        $outs++
+    }
+    return @{ words = $words; outs = $outs }
+}
+
+function Test-R1PsReadOnly {
+    # PowerShell 唯讀管線階段（含 ForEach-Object { … } 區塊）：引號內文字不算，其餘不得有寫入／執行／賦值特徵
+    param([string]$S)
+    if ($S.Length -gt 1500) { return $false }
+    foreach ($m in [regex]::Matches($S, '"[^"]*"|''[^'']*''')) {
+        $v = [string]$m.Value
+        if ($v.StartsWith('"') -and ($v.Contains('$(') -or $v.Contains('${') -or $v.Contains('`'))) { return $false }
+        if (Test-R1Rx $v $script:R1WlCodeLikeRx) { return $false }
+    }
+    $r = [regex]::Replace($S, '"[^"]*"|''[^'']*''', 'Q')
+    if ($r.Contains('"') -or $r.Contains("'")) { return $false }
+    if (Test-R1Rx $r '[>`<&^;=]|::|\$\(|\$\{|@\(|@\{') { return $false }
+    if (Test-R1Rx $r $script:R1WlPsDangerRx) { return $false }
+    foreach ($m in [regex]::Matches($r, '(?<![\w$.\-])[A-Za-z]+-[A-Za-z]+')) {
+        if (-not (Test-R1Rx ([string]$m.Value) $script:R1WlPsNounRx)) { return $false }
+    }
+    foreach ($m in [regex]::Matches($r, '\.\s*([A-Za-z_]\w*)\s*\(')) {
+        if (-not (Test-R1Rx ([string]$m.Groups[1].Value) $script:R1WlMethodOkRx)) { return $false }
+    }
+    foreach ($m in [regex]::Matches($r, '(?<![\w$.\-:@])[A-Za-z_]\w*(?![\w\-])')) {
+        if (-not (Test-R1Rx ([string]$m.Value) $script:R1WlPsWordRx)) { return $false }
+    }
+    return $true
+}
+
+function Get-R1StageShape {
+    # 一個階段吻合哪個白名單形狀（回形狀名），都不吻合回 $null；空階段回 'empty'
+    param([string]$Stage, [bool]$InPipe, [bool]$IsLast)
+    $st = $Stage.Trim()
+    if ($st.Length -eq 0) { return 'empty' }
+    $tk = Get-R1Tokens $st
+    if ($null -eq $tk -or $tk.Count -eq 0) { return $null }
+    $r = Get-R1Redirects $tk
+    if ($null -eq $r) { return $null }
+    $w = $r.words
+    $outs = [int]$r.outs
+    $n = $w.Count
+    if ($n -eq 0) { return $null }
+    if ($InPipe -and $outs -gt 0 -and -not $IsLast) { return $null }
+    $c0 = ([string]$w[0]).ToLowerInvariant()
+
+    # 指派：bash name=文字、PowerShell $name = 文字；變數名限白名單、值只能是說明文字
+    if ($n -eq 1 -and (Test-R1Rx $c0 '^[A-Za-z_]\w*=')) {
+        if ($InPipe -or $outs -gt 0) { return $null }
+        $eq = ([string]$w[0]).IndexOf('=')
+        $nm = ([string]$w[0]).Substring(0, $eq)
+        $val = ([string]$w[0]).Substring($eq + 1)
+        if (-not (Test-R1Rx $nm $script:R1WlVarNameRx)) { return $null }
+        if ($val -ne '' -and -not (Test-R1TextOk $val)) { return $null }
+        return 'assign'
+    }
+    if ($n -eq 3 -and (Test-R1Rx $c0 '^\$[A-Za-z_]\w*$') -and [string]$w[1] -eq '=') {
+        if ($InPipe -or $outs -gt 0) { return $null }
+        if (-not (Test-R1Rx ($c0.Substring(1)) $script:R1WlVarNameRx)) { return $null }
+        if (-not (Test-R1TextOk ([string]$w[2]))) { return $null }
+        return 'assign'
+    }
+
+    # with-child.mjs run／list／prune（形狀①③的後半）
+    if ($c0 -eq 'node' -or $c0 -eq 'node.exe') {
+        if ($InPipe -or $n -lt 3) { return $null }
+        $wcTok = ([string](Get-R1Unquote ([string]$w[1])).s).Replace('\', '/').ToLowerInvariant()
+        if (-not (Test-R1PathAny ([string]$w[1]))) { return $null }
+        if (-not ($wcTok.EndsWith('/with-child.mjs') -or $wcTok -eq 'with-child.mjs')) { return $null }
+        $sub = ([string]$w[2]).ToLowerInvariant()
+        if ($sub -eq 'list' -or $sub -eq 'prune') {
+            if ($n -eq 3) { return 'wc-list' }
+            return $null
+        }
+        if ($sub -ne 'run') { return $null }
+        $k = 3
+        if ($k -lt $n -and (Test-R1Rx ([string]$w[$k]) '^--timeout=\d{1,4}$')) { $k++ }
+        if ($k -ge $n -or [string]$w[$k] -ne '--') { return $null }
+        $k++
+        if ($k + 1 -ge $n) { return $null }
+        $c1 = ([string]$w[$k]).ToLowerInvariant()
+        if ($c1 -ne 'node' -and $c1 -ne 'node.exe') { return $null }
+        $sc = [string]$w[$k + 1]
+        if (-not (Test-R1PathAny $sc)) { return $null }
+        $scl = ([string](Get-R1Unquote $sc).s).ToLowerInvariant()
+        if (-not (Test-R1Rx $scl '\.(mjs|cjs|js)$')) { return $null }
+        if ($scl.Contains('session-state') -or $scl.Contains('with-child')) { return $null }
+        for ($j = $k + 2; $j -lt $n; $j++) {
+            $a = [string]$w[$j]
+            if (-not ((Test-R1Flag $a) -or (Test-R1PathAny $a) -or (Test-R1Inert $a))) { return $null }
+            if ($a.IndexOf('session-state', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or $a.IndexOf('with-child', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $null }
+        }
+        return 'wc-run'
+    }
+
+    # cp 備份（形狀③前半）：來源任意唯讀路徑、目的地必須是字面暫存路徑
+    if ($c0 -eq 'cp') {
+        if ($InPipe -or $outs -gt 0) { return $null }
+        $k = 1
+        if ($k -lt $n -and (Test-R1Rx ([string]$w[$k]) '^-[pafvnu]+$')) { $k++ }
+        if ($n - $k -ne 2) { return $null }
+        if (-not (Test-R1PathAny ([string]$w[$k]))) { return $null }
+        if (-not (Test-R1Lit ([string]$w[$k + 1]))) { return $null }
+        return 'cp'
+    }
+
+    # git commit -m 文字（形狀⑤）；其他旗標（--amend、-a、--no-verify…）一律不放行
+    if ($c0 -eq 'git') {
+        if ($InPipe -or $outs -gt 0) { return $null }
+        $k = 1
+        if ($k + 1 -lt $n -and [string]$w[$k] -ceq '-C') {
+            if (-not (Test-R1PathAny ([string]$w[$k + 1]))) { return $null }
+            $k += 2
+        }
+        if ($k -ge $n -or ([string]$w[$k]).ToLowerInvariant() -ne 'commit') { return $null }
+        $k++
+        $paths = $false
+        $hasMsg = $false
+        while ($k -lt $n) {
+            $a = [string]$w[$k]
+            if ($paths) {
+                if (-not (Test-R1PathAny $a)) { return $null }
+                $k++
+                continue
+            }
+            if ($a -eq '--') { $paths = $true; $k++; continue }
+            if ($a -ceq '-m' -and $k + 1 -lt $n) {
+                if (-not (Test-R1Inert ([string]$w[$k + 1]))) { return $null }
+                $hasMsg = $true
+                $k += 2
+                continue
+            }
+            if ($a -ceq '-F' -and $k + 1 -lt $n) {
+                if (-not (Test-R1PathAny ([string]$w[$k + 1]))) { return $null }
+                $hasMsg = $true
+                $k += 2
+                continue
+            }
+            if ($a -ceq '-q' -or $a -ceq '--quiet') { $k++; continue }
+            return $null
+        }
+        if (-not $hasMsg) { return $null }
+        return 'gitcommit'
+    }
+
+    # Set-Content／Add-Content 文字 → 字面暫存路徑（形狀④）；只認全名，不認 sc／ac 別名
+    if ($c0 -eq 'set-content' -or $c0 -eq 'add-content') {
+        if ($InPipe -or $outs -gt 0) { return $null }
+        $path = $null
+        $val = $null
+        $k = 1
+        while ($k -lt $n) {
+            $a = [string]$w[$k]
+            if ((Test-R1Rx $a '^-(path|literalpath)$') -and $k + 1 -lt $n) {
+                if ($null -ne $path) { return $null }
+                $path = [string]$w[$k + 1]
+                $k += 2
+                continue
+            }
+            if ((Test-R1Rx $a '^-value$') -and $k + 1 -lt $n) {
+                if ($null -ne $val) { return $null }
+                $val = [string]$w[$k + 1]
+                $k += 2
+                continue
+            }
+            if ((Test-R1Rx $a '^-encoding$') -and $k + 1 -lt $n) {
+                if (-not (Test-R1Rx ([string]$w[$k + 1]) '^(?:utf8|utf8nobom|utf8bom|ascii|unicode|default|oem)$')) { return $null }
+                $k += 2
+                continue
+            }
+            if (Test-R1Rx $a '^-nonewline$') { $k++; continue }
+            if ($a.StartsWith('-')) { return $null }
+            if ($null -eq $path) { $path = $a } elseif ($null -eq $val) { $val = $a } else { return $null }
+            $k++
+        }
+        if ($null -eq $path -or $null -eq $val) { return $null }
+        if (-not (Test-R1Lit $path)) { return $null }
+        if (-not (Test-R1TextOk $val)) { return $null }
+        return 'text-write'
+    }
+
+    # 唯讀指令與文字輸出指令（echo／printf／cat 帶字面暫存路徑的重導向＝text-write）
+    if ($script:R1WlRoSet.ContainsKey($c0)) {
+        $textCmd = ($c0 -eq 'echo' -or $c0 -eq 'printf')
+        $argsOk = $true
+        for ($j = 1; $j -lt $n; $j++) {
+            $a = [string]$w[$j]
+            if ($textCmd) {
+                if (-not ((Test-R1Flag $a) -or (Test-R1TextOk $a))) { $argsOk = $false; break }
+            } else {
+                if (-not ((Test-R1Flag $a) -or (Test-R1PathAny $a) -or (Test-R1Inert $a))) { $argsOk = $false; break }
+            }
+        }
+        if ($argsOk) {
+            if (($textCmd -or $c0 -eq 'cat') -and $outs -gt 0) {
+                if ($InPipe) { return $null }
+                return 'text-write'
+            }
+            return ('ro:' + $c0)
+        }
+    }
+    if ($c0 -eq 'test' -and $n -eq 3 -and $outs -eq 0 -and (Test-R1Rx ([string]$w[1]) '^-[a-z]$') -and (Test-R1PathAny ([string]$w[2]))) { return 'ro:test' }
+    if ($c0 -eq '[' -and $n -eq 4 -and $outs -eq 0 -and [string]$w[3] -eq ']' -and (Test-R1Rx ([string]$w[1]) '^-[a-z]$') -and (Test-R1PathAny ([string]$w[2]))) { return 'ro:test' }
+
+    # PowerShell 唯讀管線階段（形狀②）
+    if ($script:R1WlPsSet.ContainsKey($c0)) {
+        if (Test-R1PsReadOnly (($w | ForEach-Object { [string]$_ }) -join ' ')) { return 'ps-ro' }
+    }
+    return $null
+}
+
+function Get-R1HeredocCat {
+    # 整段指令就是 cat >(>) 字面路徑 <<'TAG' 本文 TAG（兩種寫法順序）；本文是資料不是指令，但本文內不得有等於 TAG 的行
+    # （bash 在第一個 TAG 行結束 heredoc，之後的行會被執行）
+    param([string]$Raw)
+    $patA = '^\s*cat\s+>>?\s*(?<t>"[^"\r\n]*"|''[^''\r\n]*''|[^\s"''<>|;&]+)\s*<<\s*(?<q>[''"])(?<tag>[A-Za-z_]\w*)\k<q>[ \t]*\r?\n(?<body>[\s\S]*?)\r?\n\k<tag>[ \t]*(?:\r?\n)?\s*$'
+    $patB = '^\s*cat\s+<<\s*(?<q>[''"])(?<tag>[A-Za-z_]\w*)\k<q>\s*>>?\s*(?<t>"[^"\r\n]*"|''[^''\r\n]*''|[^\s"''<>|;&]+)[ \t]*\r?\n(?<body>[\s\S]*?)\r?\n\k<tag>[ \t]*(?:\r?\n)?\s*$'
+    foreach ($pat in @($patA, $patB)) {
+        $m = (Get-GuardRx $pat).Match($Raw)
+        if (-not $m.Success) { continue }
+        $tag = [string]$m.Groups['tag'].Value
+        $body = [string]$m.Groups['body'].Value
+        if (-not (Test-R1Lit ([string]$m.Groups['t'].Value))) { return $null }
+        foreach ($ln in $body.Split([char]10)) {
+            if ($ln.TrimEnd() -eq $tag) { return $null }
+        }
+        if (Test-R1Rx $body $script:R1WlCodeLikeRx) { return $null }
+        return 'text-write'
+    }
+    return $null
+}
+
+function Convert-R1HereStrings {
+    # PowerShell here-string 指派（$msg = @" … "@）：本文是說明文字時換成單純字串，其餘照原樣留給後面拒絕
+    param([string]$Raw)
+    $ev = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $body = [string]$m.Groups[3].Value
+        if ([string]$m.Groups[2].Value -eq '"' -and ($body.Contains('$(') -or $body.Contains('${') -or $body.Contains('`'))) { return $m.Value }
+        if (Test-R1Rx $body $script:R1WlCodeLikeRx) { return $m.Value }
+        return ([string]$m.Groups[1].Value + "'x'")
+    }
+    return (Get-GuardRx '(\$[A-Za-z_]\w*\s*=\s*)@(["''])\r?\n([\s\S]*?)\r?\n\2@').Replace($Raw, $ev)
+}
+
+function Test-R1RawOk {
+    # 原始字串層的通用拒絕：控制字元、$'／$"、反斜線接引號／空白／行尾（跳脫歧義）、
+    # 引號外與雙引號內的反引號與 ^（單引號內是字面，不拒絕）
+    param([string]$Raw)
+    if (Test-R1Rx $Raw '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]') { return $false }
+    if (Test-R1Rx $Raw '\$[''"]') { return $false }
+    if (Test-R1Rx $Raw '\\(?:["''\s]|$)') { return $false }
+    foreach ($m in $script:R1RxQuoted.Matches($Raw)) {
+        $v = [string]$m.Value
+        if ($v.StartsWith('"') -and ($v.Contains('`') -or $v.Contains('^'))) { return $false }
+    }
+    $unq = $script:R1RxQuoted.Replace($Raw, '')
+    if ($unq.Contains('`') -or $unq.Contains('^')) { return $false }
+    return $true
+}
+
+function Get-R1KnownMisfire {
+    # 整段指令完全吻合某個已知誤擋形狀 → 回形狀名；否則 $null（維持舊版 deny）。任何例外或逾時 → $null（fail-closed）
+    param([string]$Raw)
+    try {
+        if ([string]::IsNullOrEmpty($Raw) -or $Raw.Length -gt $script:R1WlMaxLen) { return $null }
+        if (Test-R1Rx $Raw '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]') { return $null }
+        $hd = Get-R1HeredocCat $Raw
+        if ($null -ne $hd) { return $hd }
+        if (-not (Test-R1RawOk $Raw)) { return $null }
+        $text = Convert-R1HereStrings $Raw
+        $stmts = Split-R1Statements $text
+        if ($null -eq $stmts) { return $null }
+        $shapes = New-Object System.Collections.Generic.List[string]
+        foreach ($stages in $stmts) {
+            $ns = $stages.Count
+            for ($k = 0; $k -lt $ns; $k++) {
+                $sh = Get-R1StageShape ([string]$stages[$k]) ($ns -gt 1) ($k -eq $ns - 1)
+                if ($null -eq $sh) { return $null }
+                if ($sh -eq 'empty') { continue }
+                if ($ns -gt 1 -and -not ($sh.StartsWith('ro:') -or $sh -eq 'ps-ro')) { return $null }
+                if (-not $shapes.Contains($sh)) { [void]$shapes.Add($sh) }
+            }
+        }
+        if ($shapes.Count -eq 0) { return $null }
+        if ($shapes.Contains('wc-run') -and $shapes.Contains('text-write')) { return $null }
+        return ($shapes -join '+')
+    } catch {
+        return $null
+    }
+}
+
+# ──────────────────────────────────────────────────────────────
 # Get-GuardVerdictSingle — 單層判定（不展開殼包裹）。
 # 對外入口是檔尾的 Get-GuardVerdict（= 本函式 + 殼內層展開比較），呼叫端不受影響。
 
 # ──────────────────────────────────────────────────────────────
 function Get-GuardVerdictSingle {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Command
+    )
+
+    # P-2（M2）：互動直譯器規則排在其餘規則之後——Core 判 deny 以 Core 為準（保留 why 類別，
+    # guard-bash 靠它計 D5、不回顯含終止動詞的原文）；Core 不是 deny 才輪到 ii（deny 勝 ask／allow）。
+    # ii 吃原始字串（Get-IiSegments 自己處理換行與 heredoc），不受 Core 內 A1 正規化影響。
+    $coreVerdict = Get-GuardVerdictSingleCore -Command $Command
+    if ($null -ne $coreVerdict -and $coreVerdict.decision -eq 'deny') { return $coreVerdict }
+    $iiVerdict = Get-InteractiveInterpreterVerdict $Command
+    if ($null -ne $iiVerdict) { return $iiVerdict }
+    return $coreVerdict
+}
+
+function Get-GuardVerdictSingleCore {
     param(
         [Parameter(Mandatory)] [AllowEmptyString()] [string]$Command
     )
@@ -749,6 +1609,29 @@ function Get-GuardVerdictSingle {
         # 階段 1 審查（major）補：PowerShell 別名 kill＝Stop-Process 的 -Name／-Id／-ProcessName／-InputObject；bash 的 "$p"、${p}、$(pgrep …)、
         # 反引號、`-n N`、`-s` 黏著訊號、`--` 後接 PID；管線末端或 xargs 末端只放 kill；`% Kill`／`ForEach-Object [-MemberName] Kill`。
         @{ rx = '(^|[\s;&|(){`"''/\\=:])(?<!(docker|podman)(\s+container)?\s+)kill(\.exe)?\s+(-[1-9][0-9]*\b|-s\s*\S+|-n\s*[0-9]+\b|--\s+\S|-(SIG)?(KILL|TERM|HUP|INT|QUIT|STOP|CONT|USR1|USR2|ABRT|SEGV|ALRM|PIPE)\b|-(name|id|processname|inputobject)\b|["'']?\$[\w{(]|`|[0-9]+\b)|(\|\s*|\bxargs\s+(-\S+\s+)*)kill(\.exe)?\s*($|[;&|)])|(^|[\s;&|(){])(%|foreach-object)\s+(-membername\s+)?kill\b'; why = '程序終止指令（裸 kill／PowerShell kill 別名接訊號／PID／具名參數／管線；2026-10-10 起 deny）：只准用 with-child.mjs 收自己登記的 PID' },
+        # 偵錯埠啟動瀏覽器（2026-11-08 規格 .governance/specs/2026-11-08-remote-debugging-guard.md v1.0，使用者 2026-11-07／11-08 四項定案）：
+        # 【事故】2026-10-09 22:15 kb-bot M1 Task 13 子代理經 with-child 在 claude.exe 底下啟動 headless Chrome＋--remote-debugging-port，
+        # 2 秒後 Defender 行為偵測判 Behavior:Win32/LummaStealer.CER!MTB、處置是終止 claude.exe 主程序（整個 session 被殺）；10-10 又犯一次
+        # （Defender 當次沒出手，屬機率性）。替代做法：Chrome CLI --headless=new --screenshot=… 不開偵錯埠、專屬 --user-data-dir；互動用同源外框頁。
+        # 【判定】同一片段（以 ; & | 切開；換行已在核心第一步正規化成 ` ; `）內同時出現①瀏覽器執行檔名（chrome／chromium／msedge／brave，可帶 .exe；
+        # chrome 涵蓋 chrome-headless-shell 與 google-chrome(-stable)、chromium 涵蓋 chromium-browser，chromedriver／msedgewebview2 因字詞邊界不命中）、
+        # ②前綴 --／-／／ 的 remote-debugging-port，不限先後。比對不分大小寫（Test-GuardRx 預設）。deny、無豁免。
+        # 【使用者定案】「只是提到」（commit 訊息、rg）也擋、不做解析式豁免（改道 Grep／Read 工具或 git commit -F 檔案）；
+        # --remote-debugging-pipe 先不擋、只觀察（是否觸發 Defender 未實測）；Electron 類（code、msedgewebview2）放行；node --inspect 放行。
+        # 【殘餘風險（規格 §3，守門擋不到，明文）】①程式內部啟動 Chrome＋偵錯埠：指令列只看到 npm test（已知：invest-hub test/helpers/cdp.mjs，
+        #   交接卡已加警告）；②呼叫內含偵錯埠的腳本：指令列只看到 pwsh -File（已知：media2notes launch-course-chrome.ps1，9222 埠，交接卡已加警告）；
+        #   ③執行期組字（變數拼接、萬用字元、base64）：與終止類、webfetch 規則同一邊界（F3），只靠規則；
+        #   ④函式庫自帶旗標（Playwright 等）：旗標在函式庫內部，Playwright 預設走 pipe【推測，本機未找到安裝檔可查】，只靠規則。
+        #   旗標前綴 -、/ 與大小寫變體 Chrome 是否真的接受：未實測【推測】（實測＝用偵錯埠啟動 Chrome＝事故形狀，不做），規則一律涵蓋（保守）。
+        # 【why 類別】開頭固定「以偵錯埠啟動瀏覽器」：guard-bash／antigravity-guard 靠它不回顯指令原文、改印改道說明；不含「程序終止」「with-child 登記目錄」
+        # 「WITH_CHILD_DIR」字樣，所以不計 D5、不蓋掉上面三類既有 deny 的 why 類別（它們在陣列前面、先命中先回傳）。
+        # 【續行接回（總審 F4 M1，2026-11-09）】A1 把換行換成「 ; 」，行尾反斜線（bash）或反引號（PowerShell）續行的長指令，瀏覽器名與旗標會被切到不同片段而整串放行
+        # （2026-10-09 事故原形拆成三行即 pass）。片段字元類改成「非 ; & | 的字元，或緊接在『反斜線／反引號＋空白』之後的那個 ;」（(?<=[\\`] ); 只吃 A1 產生的續行分隔符），
+        # 兩個 lookahead 共用。殘餘：續行後的下一行其實是獨立指令的情形不會誤擋（只有行尾接續符才接回）；核心其他規則的續行缺口（如 git push --force 降成 ask）不在本規則範圍。
+        # 【比對起點不含被接回的分號（總審 F4 第二輪 V1，2026-11-09）】被接回的續行分號只准出現在 lookahead 的字元類裡、不當比對起點（起點為 ^、不被續行接回的 ;、&、|）；
+        # 否則每個被接回的分號都成了新起點、每個起點都掃到片段結尾＝二次方，600 行續行的無害 heredoc 會撞 Test-GuardRx 的 500 ms 上限、逾時當命中而誤 deny。
+        # 耗時由 test-guard-perf.ps1 的續行 300／600 行案例釘住（還原成只有 [;&|] 起點的 5f14b36 版時 600 行案例紅）。
+        @{ rx = '(?:^|(?<![\\`] );|[&|])(?=(?:[^;&|]|(?<=[\\`] );)*?\b(?:chrome|chromium|msedge|brave)(?:\.exe)?\b)(?=(?:[^;&|]|(?<=[\\`] );)*?(?:^|[^\w-])(?:--|-|/)remote-debugging-port\b)'; why = '以偵錯埠啟動瀏覽器（2026-10-09 Defender 判竊密木馬並終止整個 claude.exe）：截圖改用 Chrome CLI --screenshot（--headless=new --screenshot=檔 --window-size=… 並帶專屬 --user-data-dir），互動用同源外框頁；說明見 memory defender-cmdline-ml-false-positive 第二型。只是要提到這些字：改用 Grep／Read 工具或 git commit -F 檔案' },
         # R1：with-child 登記目錄＋寫入動詞同時出現 → deny（偽造登記；2026-10-10 攻擊語料 registry-1～6 現況零規則全放行）。
         # 階段 1 審查（major／minor）後的形狀：①兩個目錄字面 session-state 與 with-child **各自**出現即可（擋 cd 進 session-state 再對
         # with-child/ 相對路徑寫入）；②寫入動詞集合與 Test-WfDirWriteWhole 的 verbRx 對齊再加刪除／改名／sed -i／writeFileSync；
@@ -770,8 +1653,14 @@ function Get-GuardVerdictSingle {
         @{ rx = '^(?=[\s\S]*with-child(?:\.mjs)?[''"]?\s+[''"]?stop(?![\w-]))(?=[\s\S]*cross[^a-z0-9;&|]{0,8}session)'; why = 'with-child.mjs stop 帶 --cross-session（跨 session 終止他人登記的程序）：agent 不得自行加旗標。請在對話裡列出 PID、擁有者 session 與理由，由使用者在自己的終端機親手執行' },
         @{ rx = '^(?=[\s\S]*with-child(?:\.mjs)?[''"]?\s+[''"]?stop(?![\w-]))(?=[\s\S]*claude_code_session_id)'; why = 'with-child.mjs stop 與 CLAUDE_CODE_SESSION_ID 出現在同一串指令（設定／清除／抄寫身分變數冒名繞過 session 比對）：agent 不得改寫呼叫者身分。被拒請在對話裡列出 PID、擁有者 session 與理由，由使用者在自己的終端機親手執行' }
     )
+    $script:R1WlShape = $null
     foreach ($p in $denyPatterns) {
+        # R1（寫入 with-child 登記目錄）：舊版 rx 原文當 deny 底；命中後只有整段吻合已知誤擋形狀才放行（乙組 #3b，設計說明在 Get-R1KnownMisfire 上方）。
         $hit = Test-GuardRx $cmd $p.rx      # 逾時＝判斷不了＝當作命中（2c-B）
+        if (($hit -eq $true) -and $p.why.StartsWith('寫入 with-child 登記目錄', [System.StringComparison]::Ordinal)) {
+            $wlShape = Get-R1KnownMisfire $Command
+            if ($null -ne $wlShape) { $script:R1WlShape = $wlShape; $hit = $false }
+        }
         if ($hit) { return @{ decision = 'deny'; why = (Get-GuardRxWhy $hit $p.why) } }
     }
 
@@ -1003,6 +1892,32 @@ function Get-GuardVerdictSingle {
     foreach ($p in $askPatterns) {
         $hit = Test-GuardRx $cmd $p.rx      # 逾時＝判斷不了＝當作命中（2c-B）
         if ($hit) { return @{ decision = 'ask'; why = (Get-GuardRxWhy $hit $p.why) } }
+    }
+
+    # ──────────────────────────────────────────────────────
+    # 2026-11-08（乙組 #8，使用者選 A＋ask）：環境變數前綴／賦值直接帶金鑰 → ask（不 deny）。
+    # 問題：agent 打出「NAME=金鑰 指令」「export NAME=金鑰」「env NAME=金鑰 …」「$env:NAME='金鑰'」「set NAME=金鑰」時，
+    # 金鑰在**送出那一刻**就已經進了對話逐字稿；確認框擋得住執行，收不回已經出現的字串。所以提示的重點是
+    # 「視為外洩、考慮輪替、之後在自己的終端機設定」，而且提示文字本身**不回顯金鑰**（why 只寫規則說明）。
+    # 為什麼放在 core 的 ask 區而不是 guard-secrets：guard-secrets 只在 git add／commit 才介入，而且只會 deny，形狀不合。
+    # 放在 askPatterns 迴圈之後，所以超過 64 KB 的指令已經被該陣列第一條擋下，這裡不會被餵到病態長度。
+    # 金鑰樣式與 .governance/hooks-git/pre-commit、guard-secrets.ps1 同一份前綴與長度門檻
+    # （sk-ant-／sk-／gh?_／github_pat_／xox?-／AKIA／AIza／JWT／私鑰區塊）；另加 gsk_（Groq，gsk_ 後 52 個英數字元；
+    # 這條不在 pre-commit／guard-secrets，是使用者核准的建議明文點名「sk-、AIza、gsk_ 等」，本工作區 llm-panel、threads-bot 都用 Groq）；sk- 另抄 pre-commit 的兩道過濾：
+    # 值要含數字、全小寫且連字號多的英文網址 slug 不算。金鑰部分用 (?-i:) 區分大小寫
+    # （全域比對不分大小寫，不加會讓 akia 開頭的普通字串被當成金鑰）。
+    # 範圍（明文）：只抓「賦值位置」——名稱=金鑰（行首、空白、; | ( && 之後，名稱前可帶一個引號或跳脫引號）、
+    # $env:名稱=金鑰、${env:名稱}=金鑰、SetEnvironmentVariable(…金鑰…)。bash -c／powershell -c／cmd /c 的內層因為整串比對一併涵蓋。
+    # 殘餘：金鑰放在標頭／URL／--參數值（不是環境變數賦值）抓不到；沒有固定前綴的金鑰（Mistral、Z.ai 等）抓不到；
+    # 執行期才組出來的字串抓不到。這與 guard-secrets 的樣式限制同一邊界。
+    $envKeyCs = Get-GuardKeyCs      # 2026-11-09（F2）：樣式搬到 Get-GuardKeyCs，理由遮罩（Protect-GuardSecrets）共用同一份
+    $envKeyQ  = '\\?["'']?'
+    $envKeyAssignRx = '(?:^|[\s;|(]|&&)' + $envKeyQ + '[A-Za-z_][A-Za-z0-9_]*\+?=' + $envKeyQ + $envKeyCs +
+                      '|\$\{?env:[^\s=;&|}]+\}?\s*=\s*' + $envKeyQ + $envKeyCs +
+                      '|\bsetenvironmentvariable\s*\([^;&|)]{0,400}?' + $envKeyQ + $envKeyCs
+    $hit = Test-GuardRx $cmd $envKeyAssignRx      # 逾時＝判斷不了＝當作命中（2c-B）
+    if ($hit) {
+        return @{ decision = 'ask'; why = (Get-GuardRxWhy $hit '指令把金鑰直接寫成環境變數前綴／賦值（NAME=金鑰、export、env、set、PowerShell 的 $env:）：金鑰在送出這一刻就已經留在對話逐字稿，請視為外洩並考慮輪替；之後請在自己的終端機設定環境變數，不要把金鑰貼進對話。（本提示刻意不回顯金鑰內容）') }
     }
 
     return @{ decision = 'pass'; why = '' }
@@ -1352,6 +2267,18 @@ function Get-GuardVerdict {
         [Parameter(Mandatory)] [AllowEmptyString()] [string]$Command,
         [int]$Depth = 0
     )
+    # 2026-11-09（F2）：判定本體在 Get-GuardVerdictUnmasked（遞迴只在裡面走、不重複遮罩）；
+    # 這個對外入口只多一件事——why 裡的金鑰換成固定遮罩字樣（Protect-GuardSecrets）。decision 與 why 的類別開頭不動。
+    $v = Get-GuardVerdictUnmasked -Command $Command -Depth $Depth
+    if ($null -ne $v -and $v -is [hashtable] -and $v.ContainsKey('why')) { $v['why'] = Protect-GuardSecrets "$($v['why'])" }
+    return $v
+}
+
+function Get-GuardVerdictUnmasked {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Command,
+        [int]$Depth = 0
+    )
     $verdict = Get-GuardVerdictSingle -Command $Command
     if ($verdict.decision -eq 'deny') { return $verdict }   # 已最嚴格，短路
 
@@ -1367,7 +2294,7 @@ function Get-GuardVerdict {
     if ($Depth -ge 3) { return $verdict }                   # 深度保險（Expand 已迴圈到穩定）
 
     $rank = @{ 'pass' = 0; 'ask' = 1; 'deny' = 2 }
-    $innerVerdict = Get-GuardVerdict -Command $inner -Depth ($Depth + 1)
+    $innerVerdict = Get-GuardVerdictUnmasked -Command $inner -Depth ($Depth + 1)
     if ($rank[$innerVerdict.decision] -gt $rank[$verdict.decision]) {
         return @{ decision = $innerVerdict.decision; why = "殼包裹內層：$($innerVerdict.why)" }
     }
